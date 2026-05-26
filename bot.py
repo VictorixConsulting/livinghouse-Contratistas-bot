@@ -862,7 +862,7 @@ if __name__ == "__main__":
 # ASISTENTE IA — GEMINI
 # ═══════════════════════════════════════════════════════════════
 
-from google import genai as google_genai
+import requests as http_requests
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -938,8 +938,8 @@ async def ask_gemini(question: str, user_name: str) -> str:
 
     try:
         context = get_context_data()
-        
-        system_prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
+
+        prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
 una fábrica de muebles en Manizales, Colombia.
 
 Tu trabajo es responder preguntas sobre producción, contratistas, entregas y pagos 
@@ -949,18 +949,22 @@ responder algo, dilo claramente.
 
 Quien pregunta: {user_name}
 
-{context}"""
+{context}
 
-        client = google_genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=f"{system_prompt}\n\nPregunta: {question}"
-        )
-        return response.text
+Pregunta: {question}"""
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}]
+        }
+        response = http_requests.post(url, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
 
     except Exception as e:
         logger.error(f"Error con Gemini: {e}")
-        return f"⚠️ No pude procesar tu pregunta. Error: {str(e)[:100]}"
+        return f"⚠️ No pude procesar tu pregunta en este momento."
 
 
 async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
