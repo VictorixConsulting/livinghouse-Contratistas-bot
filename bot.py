@@ -1,5 +1,5 @@
 """
-LIVINGHOUSE · BOT DE CONTROL DE PRODUCCIÓN V2
+LIVINGHOUSE · BOT DE CONTROL DE PRODUCCIÓN
 ==========================================
 Oficios soportados: corte_costura, tapiceria, pintura, esqueleteria, carpinteria
 """
@@ -146,7 +146,9 @@ def get_context_data() -> str:
 
 async def ask_claude(question: str, user_name: str) -> str:
     """Llama a la API de Claude (Anthropic) con el contexto de Livinghouse."""
+    logger.info(f"ask_claude: ANTHROPIC_API_KEY presente = {bool(ANTHROPIC_API_KEY)}")
     if not ANTHROPIC_API_KEY:
+        logger.warning("ask_claude: no hay ANTHROPIC_API_KEY, retornando None")
         return None  # señal para probar Gemini
     try:
         context = get_context_data()
@@ -169,15 +171,19 @@ async def ask_claude(question: str, user_name: str) -> str:
             "system": system,
             "messages": [{"role": "user", "content": question}],
         }
+        logger.info("ask_claude: llamando a Anthropic API...")
         response = http_requests.post(
             "https://api.anthropic.com/v1/messages",
             headers=headers, json=payload, timeout=30
         )
+        logger.info(f"ask_claude: response status = {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"ask_claude: respuesta no-200: {response.text[:500]}")
         response.raise_for_status()
         data = response.json()
         return data["content"][0]["text"]
     except Exception as e:
-        logger.error(f"Error con Claude: {e}")
+        logger.error(f"Error con Claude: {type(e).__name__}: {e}")
         return "⚠️ No pude procesar tu pregunta en este momento."
 
 
