@@ -106,7 +106,32 @@ def get_context_data() -> str:
             .execute().data
         workers = supabase.table("workers").select("*").eq("activo", True).execute().data
 
-        lines = ["=== DATOS DE PRODUCCIÓN LIVINGHOUSE (últimos 30 días) ===\n"]
+        lines = [
+            "=== SISTEMA LIVINGHOUSE ===",
+            "Livinghouse es una fábrica de muebles en Manizales, Colombia.",
+            "Cristhian es el dueño y administra todo el sistema desde el bot de Telegram.",
+            "",
+            "OFICIOS QUE MANEJA LA FÁBRICA (6):",
+            "  ✂️ Corte y Costura",
+            "  🛋️ Tapicería",
+            "  🪚 Carpintería",
+            "  🔧 Esqueletería",
+            "  🎨 Pintura",
+            "",
+            "ROLES Y FLUJO DE TRABAJO:",
+            "  - CONTRATISTAS: trabajadores externos que producen muebles.",
+            "    Reportan cada trabajo terminado con el comando /reportar (selecciona oficio, FVE, producto, foto).",
+            "  - VERIFICADORES (como Cindy y Juan David): revisan reportes con /pendientes y aprueban/rechazan/modifican.",
+            "    Cada producto reportado tiene un precio según oficio. Cuando un verificador aprueba, se registra para pago.",
+            "",
+            "COMANDOS DISPONIBLES:",
+            "  /reportar - inicia el flujo para reportar una entrega (selección por botones)",
+            "  /pendientes - lista entregas que esperan aprobación",
+            "  /resumen - resumen de producción y pagos",
+            "  /precios - consulta la lista de precios por oficio",
+            "",
+            "=== DATOS REALES (últimos 30 días) ===",
+        ]
 
         resumen_workers = {}
         for d in deliveries:
@@ -118,31 +143,64 @@ def get_context_data() -> str:
                 resumen_workers[nombre]["total"] += float(d.get("final_price", 0))
                 resumen_workers[nombre]["aprobadas"] += 1
 
-        lines.append("RESUMEN POR CONTRATISTA:")
-        for nombre, datos in resumen_workers.items():
-            lines.append(f"  - {nombre}: {datos['cantidad']} entregas ({datos['aprobadas']} aprobadas), total aprobado: ${datos['total']:,.0f}")
+        lines.append("\nRESUMEN POR CONTRATISTA:")
+        if resumen_workers:
+            for nombre, datos in resumen_workers.items():
+                lines.append(f"  - {nombre}: {datos['cantidad']} entregas ({datos['aprobadas']} aprobadas), total aprobado: ${datos['total']:,.0f}")
+        else:
+            lines.append("  (sin entregas registradas aún)")
 
         lines.append("\nÚLTIMAS 20 ENTREGAS:")
-        for d in deliveries[:20]:
-            nombre = d.get("workers", {}).get("name", "?")
-            fecha = d["created_at"][:10]
-            oficio = d.get("notes", "").replace("Oficio: ", "") if d.get("notes") and "Oficio:" in str(d.get("notes", "")) else ""
-            lines.append(f"  - {fecha} | {nombre} | {d['product_name'][:40]} | {oficio} | ${float(d.get('final_price',0)):,.0f} | {d['status']}")
+        if deliveries:
+            for d in deliveries[:20]:
+                nombre = d.get("workers", {}).get("name", "?")
+                fecha = d["created_at"][:10]
+                oficio = d.get("notes", "").replace("Oficio: ", "") if d.get("notes") and "Oficio:" in str(d.get("notes", "")) else ""
+                lines.append(f"  - {fecha} | {nombre} | {d['product_name'][:40]} | {oficio} | ${float(d.get('final_price',0)):,.0f} | {d['status']}")
+        else:
+            lines.append("  (sin entregas registradas aún)")
 
         pend = [d for d in deliveries if d["status"] == "pending"]
-        lines.append(f"\nENTREGAS PENDIENTES: {len(pend)}")
+        lines.append(f"\nENTREGAS PENDIENTES DE APROBACIÓN: {len(pend)}")
         for d in pend[:5]:
             nombre = d.get("workers", {}).get("name", "?")
             lines.append(f"  - {nombre} | {d['product_name'][:40]} | ${float(d.get('final_price',0)):,.0f}")
 
-        lines.append(f"\nCONTRATISTAS REGISTRADOS ({len(workers)}):")
-        for w in workers:
-            lines.append(f"  - {w['name']}")
+        lines.append(f"\nCONTRATISTAS ACTIVOS REGISTRADOS ({len(workers)}):")
+        if workers:
+            for w in workers:
+                lines.append(f"  - {w['name']}")
+        else:
+            lines.append("  (aún no se han registrado contratistas en el sistema)")
 
         return "\n".join(lines)
     except Exception as e:
         logger.error(f"Error obteniendo contexto: {e}")
         return "No se pudo obtener datos de la base de datos."
+
+
+def build_system_prompt(user_name: str, context: str) -> str:
+    """Construye el prompt de sistema con rol, flujos y contexto operativo."""
+    return (
+        f"Eres el asistente conversacional de Livinghouse, una fábrica de muebles en Manizales, Colombia. "
+        f"Estás hablando con {user_name}, quien tiene acceso administrativo al sistema (es dueño o verificador, "
+        f"con permisos completos sobre el bot). NUNCA le digas que contacte a otro encargado: él ES el encargado.\n\n"
+        "TU ROL:\n"
+        "Responder con calidez, claridad y brevedad en español. Usa emojis con moderación (no saludes repetidamente "
+        "en la misma conversación). Cuando una solicitud requiera una acción del sistema, "
+        "sugiere el comando exacto del bot:\n"
+        "  • /reportar - para registrar una entrega de un trabajo terminado (selección guiada por botones: "
+        "oficio, FVE, producto, foto)\n"
+        "  • /pendientes - para revisar y aprobar/rechazar/modificar entregas en espera\n"
+        "  • /resumen - para ver el resumen de producción y pagos\n"
+        "  • /precios - para consultar la lista de precios por oficio\n\n"
+        "Si te piden información que no está en los datos (fotos individuales, archivos, detalles fuera de los "
+        "registros), reconócelo con naturalidad y sugiere cómo conseguirla (revisar Telegram con el contratista, "
+        "ver la base de datos, etc.) sin inventar.\n\n"
+        "Si te saludan informalmente, responde breve y vuelve a estar disponible — no repitas tu introducción "
+        "completa en cada mensaje.\n\n"
+        f"{context}"
+    )
 
 
 async def ask_openrouter(question: str, user_name: str) -> str:
@@ -151,14 +209,7 @@ async def ask_openrouter(question: str, user_name: str) -> str:
         return None
     try:
         context = get_context_data()
-        system = (
-            "Eres el asistente inteligente del sistema de producción de Livinghouse, "
-            "una fábrica de muebles en Manizales, Colombia. Responde preguntas sobre "
-            "producción, contratistas, entregas y pagos basándote ÚNICAMENTE en los "
-            "datos proporcionados. Responde en español, claro y conciso. Usa emojis "
-            "apropiados.\n\n"
-            f"Quien pregunta: {user_name}\n\n{context}"
-        )
+        system = build_system_prompt(user_name, context)
         headers = {
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
@@ -195,14 +246,7 @@ async def ask_claude(question: str, user_name: str) -> str:
         return None  # señal para probar Gemini
     try:
         context = get_context_data()
-        system = (
-            "Eres el asistente inteligente del sistema de producción de Livinghouse, "
-            "una fábrica de muebles en Manizales, Colombia. Responde preguntas sobre "
-            "producción, contratistas, entregas y pagos basándote ÚNICAMENTE en los "
-            "datos proporcionados. Responde en español, claro y conciso. Usa emojis "
-            "apropiados.\n\n"
-            f"Quien pregunta: {user_name}\n\n{context}"
-        )
+        system = build_system_prompt(user_name, context)
         headers = {
             "x-api-key": ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
@@ -241,15 +285,8 @@ async def ask_gemini(question: str, user_name: str) -> str:
     if GEMINI_API_KEY:
         try:
             context = get_context_data()
-            prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
-una fábrica de muebles en Manizales, Colombia.
-Responde preguntas sobre producción, contratistas, entregas y pagos basándote ÚNICAMENTE 
-en los datos proporcionados. Responde en español, claro y conciso. Usa emojis apropiados.
-Quien pregunta: {user_name}
-
-{context}
-
-Pregunta: {question}"""
+            system = build_system_prompt(user_name, context)
+            prompt = f"{system}\n\nPregunta del usuario: {question}"
 
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
             logger.info(f"ask_gemini: llamando, prompt tiene {len(prompt)} caracteres")
