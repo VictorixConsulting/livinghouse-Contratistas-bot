@@ -46,6 +46,7 @@ OFICIOS = {
 }
 
 OFICIO, FVE, PRODUCT_NAME, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(6)
+PAY_WORKER, PAY_AMOUNT, PAY_CONFIRM = range(10, 13)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -187,18 +188,45 @@ def build_system_prompt(user_name: str, context: str) -> str:
         f"con permisos completos sobre el bot). NUNCA le digas que contacte a otro encargado: él ES el encargado.\n\n"
         "TU ROL:\n"
         "Responder con calidez, claridad y brevedad en español. Usa emojis con moderación (no saludes repetidamente "
-        "en la misma conversación). Cuando una solicitud requiera una acción del sistema, "
-        "sugiere el comando exacto del bot:\n"
-        "  • /reportar - para registrar una entrega de un trabajo terminado (selección guiada por botones: "
-        "oficio, FVE, producto, foto)\n"
-        "  • /pendientes - para revisar y aprobar/rechazar/modificar entregas en espera\n"
-        "  • /resumen - para ver el resumen de producción y pagos\n"
-        "  • /precios - para consultar la lista de precios por oficio\n\n"
+        "en la misma conversación). Si una solicitud requiere una acción del sistema, sugiere el comando exacto.\n\n"
+        "=== FLUJO COMPLETO DE PRODUCCIÓN ===\n\n"
+        "1) REPORTE DEL CONTRATISTA (comando /reportar):\n"
+        "   El contratista (Joselyn y otros que se vayan registrando) entra al bot y reporta una entrega terminada. "
+        "El flujo guiado por botones es:\n"
+        "   a. Selecciona su oficio (corte/costura, tapicería, carpintería, esqueletería, pintura)\n"
+        "   b. Indica la FVE (Factura de Venta a la que pertenece el trabajo)\n"
+        "   c. Escribe el nombre del producto entregado\n"
+        "   d. El bot busca el precio en la lista del oficio correspondiente. Si existe, lo asigna automáticamente. "
+        "Si no aparece, permite ingresar un precio especial.\n"
+        "   e. El contratista envía una foto del producto terminado como evidencia.\n"
+        "   f. La entrega queda en estado 'pendiente' y se notifica a los verificadores.\n\n"
+        "2) VERIFICACIÓN (comando /pendientes):\n"
+        "   Los verificadores (Cindy, Juan David, y otros administradores) reciben la notificación con la foto y los datos. "
+        "Pueden:\n"
+        "   • APROBAR la entrega (queda lista para cuenta de cobro)\n"
+        "   • RECHAZAR (con un motivo escrito que se envía al contratista)\n"
+        "   • MODIFICAR el precio o detalles antes de aprobar\n\n"
+        "3) ACUMULACIÓN DE CUENTA DE COBRO:\n"
+        "   Cada entrega aprobada se va sumando al saldo pendiente de pago del contratista. "
+        "Esto forma su 'cuenta de cobro' actual — lo que la fábrica le debe en este momento.\n\n"
+        "4) PAGO Y CORTE DE CUENTA (a futuro):\n"
+        "   Cuando la fábrica le paga a un contratista (por ejemplo cada quincena), un verificador debe registrar "
+        "ese pago en el sistema. Al registrarlo, todas las entregas aprobadas hasta ese momento quedan marcadas "
+        "como 'pagadas' y la cuenta de cobro del contratista se reinicia en cero. A partir de ahí, vuelve a "
+        "acumular las próximas entregas aprobadas hasta el siguiente pago. "
+        "Esta funcionalidad de registrar pagos y hacer el corte de cuenta forma parte de la siguiente fase "
+        "del sistema (el dashboard web), todavía no está implementada en el bot.\n\n"
+        "COMANDOS DISPONIBLES ACTUALMENTE:\n"
+        "  • /reportar - inicia el flujo para registrar una entrega\n"
+        "  • /pendientes - lista entregas que esperan aprobación\n"
+        "  • /resumen - resumen general de producción\n"
+        "  • /precios - consulta la lista de precios por oficio\n"
+        "  • /cuenta - consulta el saldo actual por cobrar (contratista ve el suyo; verificador ve el de todos)\n"
+        "  • /pagar - (solo verificadores) registra un pago a un contratista, con soporte para abonos parciales\n"
+        "  • /historial - ver pagos pasados (contratista ve los suyos; verificador puede usar /historial <nombre> para ver los de alguien específico)\n\n"
         "Si te piden información que no está en los datos (fotos individuales, archivos, detalles fuera de los "
-        "registros), reconócelo con naturalidad y sugiere cómo conseguirla (revisar Telegram con el contratista, "
-        "ver la base de datos, etc.) sin inventar.\n\n"
-        "Si te saludan informalmente, responde breve y vuelve a estar disponible — no repitas tu introducción "
-        "completa en cada mensaje.\n\n"
+        "registros), reconócelo con naturalidad sin inventar. Si te saludan informalmente, responde breve "
+        "y vuelve a estar disponible — no repitas la introducción completa en cada mensaje.\n\n"
         f"{context}"
     )
 
@@ -892,6 +920,380 @@ async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ═══════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════
+# LÓGICA DE PAGOS Y CUENTAS DE COBRO
+# ═══════════════════════════════════════════════════════════════
+
+def get_pending_deliveries_for_worker(worker_id: int):
+    """Entregas aprobadas y aún no pagadas de un contratista."""
+    try:
+        return supabase.table("deliveries")\
+            .select("*")\
+            .eq("worker_id", worker_id)\
+            .eq("status", "approved")\
+            .is_("payment_id", "null")\
+            .order("created_at", desc=False)\
+            .execute().data or []
+    except Exception as e:
+        logger.error(f"Error obteniendo entregas pendientes de pago: {e}")
+        return []
+
+
+def get_previous_balance(worker_id: int) -> float:
+    """Saldo pendiente del último corte de cobro de un contratista."""
+    try:
+        last = supabase.table("payments")\
+            .select("saldo_pendiente")\
+            .eq("worker_id", worker_id)\
+            .order("created_at", desc=True)\
+            .limit(1)\
+            .execute().data
+        if last:
+            return float(last[0].get("saldo_pendiente", 0) or 0)
+        return 0.0
+    except Exception as e:
+        logger.error(f"Error obteniendo saldo previo: {e}")
+        return 0.0
+
+
+def get_cuenta_actual(worker_id: int):
+    """Resumen de la cuenta de cobro actual de un contratista.
+    Retorna: {entregas, total_entregas, saldo_previo, total_a_cobrar}
+    """
+    entregas = get_pending_deliveries_for_worker(worker_id)
+    total_entregas = sum(float(d.get("final_price", 0) or 0) for d in entregas)
+    saldo_previo = get_previous_balance(worker_id)
+    return {
+        "entregas": entregas,
+        "total_entregas": total_entregas,
+        "saldo_previo": saldo_previo,
+        "total_a_cobrar": total_entregas + saldo_previo,
+    }
+
+
+def get_workers_with_pending_balance():
+    """Contratistas con entregas aprobadas sin pagar o saldo previo > 0."""
+    try:
+        all_workers = supabase.table("workers").select("*").eq("activo", True).execute().data or []
+        result = []
+        for w in all_workers:
+            cuenta = get_cuenta_actual(w["id"])
+            if cuenta["total_a_cobrar"] > 0:
+                result.append({**w, "cuenta": cuenta})
+        return result
+    except Exception as e:
+        logger.error(f"Error listando contratistas con saldo: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMANDO /pagar — registrar pago a un contratista
+# ═══════════════════════════════════════════════════════════════
+
+async def pagar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_verifier(update.effective_user.id):
+        await update.message.reply_text("⚠️ Solo los verificadores pueden registrar pagos.")
+        return ConversationHandler.END
+
+    workers = get_workers_with_pending_balance()
+    if not workers:
+        await update.message.reply_text("✅ No hay contratistas con saldo por pagar en este momento.")
+        return ConversationHandler.END
+
+    keyboard = []
+    for w in workers:
+        total = w["cuenta"]["total_a_cobrar"]
+        keyboard.append([InlineKeyboardButton(
+            f"{w['name']} — {fmt_price(total)}",
+            callback_data=f"pay_w_{w['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="pay_cancel")])
+
+    await update.message.reply_text(
+        "💰 *Registrar pago a contratista*\n\nElige a quién le vas a pagar:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return PAY_WORKER
+
+
+async def pagar_got_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "pay_cancel":
+        await query.edit_message_text("❌ Pago cancelado.")
+        return ConversationHandler.END
+
+    worker_id = int(query.data.replace("pay_w_", ""))
+    worker = supabase.table("workers").select("*").eq("id", worker_id).execute().data
+    if not worker:
+        await query.edit_message_text("⚠️ Contratista no encontrado.")
+        return ConversationHandler.END
+
+    worker = worker[0]
+    cuenta = get_cuenta_actual(worker_id)
+
+    context.user_data["pay_worker_id"] = worker_id
+    context.user_data["pay_worker_name"] = worker["name"]
+    context.user_data["pay_cuenta"] = cuenta
+
+    detalle = f"💼 *Cuenta de cobro de {worker['name']}*\n\n"
+    if cuenta["saldo_previo"] > 0:
+        detalle += f"📌 Saldo arrastrado anterior: {fmt_price(cuenta['saldo_previo'])}\n"
+    detalle += f"📦 Entregas aprobadas sin pagar: {len(cuenta['entregas'])}\n"
+    detalle += f"💵 Subtotal entregas: {fmt_price(cuenta['total_entregas'])}\n"
+    detalle += f"\n*TOTAL A COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n\n"
+
+    if cuenta["entregas"]:
+        detalle += "_Últimas entregas:_\n"
+        for d in cuenta["entregas"][:8]:
+            fecha = d["created_at"][:10]
+            detalle += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
+        if len(cuenta["entregas"]) > 8:
+            detalle += f"  …y {len(cuenta['entregas']) - 8} más\n"
+
+    detalle += f"\n¿Cuánto le vas a pagar? Escribe el monto en números (ej: `{int(cuenta['total_a_cobrar'])}` para pago total o menos para abono):"
+
+    await query.edit_message_text(detalle, parse_mode="Markdown")
+    return PAY_AMOUNT
+
+
+async def pagar_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().replace(",", "").replace(".", "").replace("$", "").replace(" ", "")
+    try:
+        monto = float(text)
+        if monto <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_text("⚠️ Monto inválido. Escribe solo números (ej: 500000).")
+        return PAY_AMOUNT
+
+    cuenta = context.user_data.get("pay_cuenta", {})
+    total_a_cobrar = cuenta.get("total_a_cobrar", 0)
+
+    if monto > total_a_cobrar:
+        await update.message.reply_text(
+            f"⚠️ El monto ({fmt_price(monto)}) es mayor a lo que se debe ({fmt_price(total_a_cobrar)}). "
+            "Escribe un valor igual o menor."
+        )
+        return PAY_AMOUNT
+
+    saldo_pendiente = total_a_cobrar - monto
+    context.user_data["pay_monto"] = monto
+    context.user_data["pay_saldo_pendiente"] = saldo_pendiente
+
+    tipo = "TOTAL ✅" if saldo_pendiente == 0 else f"ABONO PARCIAL (queda debiendo {fmt_price(saldo_pendiente)})"
+
+    resumen_txt = (
+        f"📋 *Confirma el pago a {context.user_data['pay_worker_name']}*\n\n"
+        f"Total a cobrar: {fmt_price(total_a_cobrar)}\n"
+        f"Monto a pagar:  *{fmt_price(monto)}*\n"
+        f"Tipo: {tipo}\n"
+    )
+    if saldo_pendiente > 0:
+        resumen_txt += f"\n💡 El saldo de {fmt_price(saldo_pendiente)} se arrastrará a la próxima cuenta de cobro."
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirmar pago", callback_data="pay_confirm_yes")],
+        [InlineKeyboardButton("❌ Cancelar",       callback_data="pay_confirm_no")],
+    ]
+    await update.message.reply_text(resumen_txt, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return PAY_CONFIRM
+
+
+async def pagar_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "pay_confirm_no":
+        await query.edit_message_text("❌ Pago cancelado.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    worker_id = context.user_data.get("pay_worker_id")
+    worker_name = context.user_data.get("pay_worker_name")
+    cuenta = context.user_data.get("pay_cuenta")
+    monto = context.user_data.get("pay_monto")
+    saldo_pendiente = context.user_data.get("pay_saldo_pendiente")
+    verifier = get_verifier(update.effective_user.id)
+
+    try:
+        # Crear el registro del pago
+        payment = supabase.table("payments").insert({
+            "worker_id":       worker_id,
+            "total_facturado": cuenta["total_a_cobrar"],
+            "monto_pagado":    monto,
+            "saldo_pendiente": saldo_pendiente,
+            "saldo_previo":    cuenta["saldo_previo"],
+            "registrado_por":  verifier["id"] if verifier else None,
+        }).execute().data[0]
+
+        # Vincular todas las entregas a este pago
+        for d in cuenta["entregas"]:
+            supabase.table("deliveries").update({"payment_id": payment["id"]}).eq("id", d["id"]).execute()
+
+        respuesta = (
+            f"✅ *Pago registrado*\n\n"
+            f"👤 {worker_name}\n"
+            f"💵 Pagado: {fmt_price(monto)}\n"
+            f"📦 Entregas saldadas: {len(cuenta['entregas'])}\n"
+        )
+        if saldo_pendiente > 0:
+            respuesta += f"\n📌 Saldo pendiente arrastrado: *{fmt_price(saldo_pendiente)}*"
+        else:
+            respuesta += "\n🎉 ¡Cuenta totalmente saldada!"
+
+        await query.edit_message_text(respuesta, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error registrando pago: {e}")
+        await query.edit_message_text(f"⚠️ Error al registrar el pago: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def pagar_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Pago cancelado.")
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMANDO /cuenta — consultar saldo actual
+# ═══════════════════════════════════════════════════════════════
+
+async def cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    # Si es contratista, ve su propia cuenta
+    worker = get_worker(user_id)
+    if worker:
+        cuenta = get_cuenta_actual(worker["id"])
+        msg = f"💼 *Tu cuenta de cobro actual*\n\n"
+        if cuenta["saldo_previo"] > 0:
+            msg += f"📌 Saldo arrastrado: {fmt_price(cuenta['saldo_previo'])}\n"
+        msg += f"📦 Entregas aprobadas sin pagar: {len(cuenta['entregas'])}\n"
+        msg += f"💵 Subtotal entregas: {fmt_price(cuenta['total_entregas'])}\n"
+        msg += f"\n*TOTAL POR COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n"
+
+        if cuenta["entregas"]:
+            msg += "\n_Detalle de entregas:_\n"
+            for d in cuenta["entregas"][:10]:
+                fecha = d["created_at"][:10]
+                msg += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # Si es verificador, ve cuenta de todos los que tienen saldo
+    if is_verifier(user_id):
+        workers = get_workers_with_pending_balance()
+        if not workers:
+            await update.message.reply_text("✅ Ningún contratista tiene saldo por cobrar en este momento.")
+            return
+
+        msg = "💼 *Cuentas de cobro pendientes*\n\n"
+        total_general = 0
+        for w in workers:
+            c = w["cuenta"]
+            total_general += c["total_a_cobrar"]
+            msg += f"👤 *{w['name']}*\n"
+            if c["saldo_previo"] > 0:
+                msg += f"   Saldo arrastrado: {fmt_price(c['saldo_previo'])}\n"
+            msg += f"   Entregas: {len(c['entregas'])} — Subtotal: {fmt_price(c['total_entregas'])}\n"
+            msg += f"   *Total a cobrar: {fmt_price(c['total_a_cobrar'])}*\n\n"
+
+        msg += f"━━━━━━━━━━━━━━━━━\n*Total general por pagar: {fmt_price(total_general)}*"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("⚠️ No estás registrado en el sistema.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMANDO /historial — pagos pasados
+# ═══════════════════════════════════════════════════════════════
+
+async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    worker = get_worker(user_id)
+    es_verificador = is_verifier(user_id)
+
+    if not worker and not es_verificador:
+        await update.message.reply_text("⚠️ No estás registrado en el sistema.")
+        return
+
+    # Contratista: ve su propio historial
+    if worker and not es_verificador:
+        pagos = supabase.table("payments")\
+            .select("*")\
+            .eq("worker_id", worker["id"])\
+            .order("created_at", desc=True)\
+            .limit(20)\
+            .execute().data or []
+        await _mostrar_historial(update, worker["name"], pagos)
+        return
+
+    # Verificador: si pasa argumento, ve el de ese contratista; si no, lista general
+    args = context.args
+    if args:
+        nombre_busqueda = " ".join(args).lower()
+        workers_all = supabase.table("workers").select("*").execute().data or []
+        match = next((w for w in workers_all if nombre_busqueda in w["name"].lower()), None)
+        if not match:
+            await update.message.reply_text(f"⚠️ No encontré un contratista con nombre similar a '{nombre_busqueda}'.")
+            return
+        pagos = supabase.table("payments")\
+            .select("*")\
+            .eq("worker_id", match["id"])\
+            .order("created_at", desc=True)\
+            .limit(20)\
+            .execute().data or []
+        await _mostrar_historial(update, match["name"], pagos)
+        return
+
+    # Verificador sin argumento: historial general de últimos 20 pagos
+    pagos = supabase.table("payments")\
+        .select("*, workers(name)")\
+        .order("created_at", desc=True)\
+        .limit(20)\
+        .execute().data or []
+    if not pagos:
+        await update.message.reply_text("📭 Aún no se han registrado pagos.")
+        return
+    msg = "📜 *Últimos 20 pagos registrados*\n\n"
+    for p in pagos:
+        fecha = p["created_at"][:10]
+        nombre = (p.get("workers") or {}).get("name", "?")
+        msg += f"• {fecha} — {nombre} — {fmt_price(float(p['monto_pagado']))}"
+        if float(p.get("saldo_pendiente", 0)) > 0:
+            msg += f" _(quedó {fmt_price(float(p['saldo_pendiente']))})_"
+        msg += "\n"
+    msg += "\n💡 Para ver el historial de un contratista específico: `/historial <nombre>`"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def _mostrar_historial(update: Update, nombre: str, pagos: list):
+    if not pagos:
+        await update.message.reply_text(f"📭 {nombre} aún no tiene pagos registrados.")
+        return
+    msg = f"📜 *Historial de pagos de {nombre}*\n\n"
+    total_recibido = 0.0
+    for p in pagos:
+        fecha = p["created_at"][:10]
+        monto = float(p["monto_pagado"])
+        total_recibido += monto
+        msg += f"• {fecha}\n"
+        msg += f"  Facturado: {fmt_price(float(p['total_facturado']))}\n"
+        msg += f"  Pagado:    *{fmt_price(monto)}*\n"
+        if float(p.get("saldo_pendiente", 0)) > 0:
+            msg += f"  Saldo:     {fmt_price(float(p['saldo_pendiente']))} _(arrastrado)_\n"
+        msg += "\n"
+    msg += f"━━━━━━━━━━━━━━━━━\n💰 *Total recibido históricamente: {fmt_price(total_recibido)}*"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -909,12 +1311,26 @@ def main():
         allow_reentry=True,
     )
 
+    pay_conv = ConversationHandler(
+        entry_points=[CommandHandler("pagar", pagar_start)],
+        states={
+            PAY_WORKER:  [CallbackQueryHandler(pagar_got_worker,  pattern=r"^pay_(w_|cancel)")],
+            PAY_AMOUNT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, pagar_got_amount)],
+            PAY_CONFIRM: [CallbackQueryHandler(pagar_confirm,     pattern=r"^pay_confirm_")],
+        },
+        fallbacks=[CommandHandler("cancelar", pagar_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(conv)
+    app.add_handler(pay_conv)
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("mistotal",   mis_total))
     app.add_handler(CommandHandler("pendientes", pendientes))
     app.add_handler(CommandHandler("resumen",    resumen))
     app.add_handler(CommandHandler("precios",    precios))
+    app.add_handler(CommandHandler("cuenta",     cuenta))
+    app.add_handler(CommandHandler("historial",  historial))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_question))
