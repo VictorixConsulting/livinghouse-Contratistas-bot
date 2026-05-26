@@ -166,7 +166,7 @@ async def ask_openrouter(question: str, user_name: str) -> str:
             "X-Title": "Livinghouse Bot",
         }
         payload = {
-            "model": "deepseek/deepseek-chat-v3-0324:free",
+            "model": "deepseek/deepseek-v4-flash:free",
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": question},
