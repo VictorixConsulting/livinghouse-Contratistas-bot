@@ -45,7 +45,7 @@ OFICIOS = {
     "pintura":       "🎨 Pintura",
 }
 
-OFICIO, FVE, PRODUCT_NAME, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(6)
+OFICIO, FVE, PRODUCT_NAME, PICK_PRODUCT, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(7)
 PAY_WORKER, PAY_AMOUNT, PAY_CONFIRM = range(10, 13)
 CLOSE_WORKER, CLOSE_CONFIRM = range(20, 22)
 
@@ -70,19 +70,34 @@ def get_verifier(telegram_id: int):
     r = supabase.table("verifiers").select("*").eq("telegram_id", telegram_id).execute()
     return r.data[0] if r.data else None
 
-def find_price(product_name: str, oficio: str):
+def find_prices(product_name: str, oficio: str):
+    """Devuelve todas las coincidencias de productos en el oficio.
+    1) Match exacto → solo esa
+    2) Coincidencia parcial por palabras clave → todas las que coincidan
+    """
+    # 1) Match exacto
     r = supabase.table("price_list").select("*").eq("active", True)\
         .eq("oficio", oficio).ilike("product_name", product_name).execute()
     if r.data:
-        return r.data[0]
+        return r.data
+
+    # 2) Coincidencia parcial: buscar por palabras clave del nombre
+    matches = {}  # usamos dict por id para evitar duplicados
     for kw in product_name.upper().split():
-        if len(kw) < 4:
+        if len(kw) < 3:
             continue
         r = supabase.table("price_list").select("*").eq("active", True)\
             .eq("oficio", oficio).ilike("product_name", f"%{kw}%").execute()
-        if r.data:
-            return r.data[0]
-    return None
+        for item in (r.data or []):
+            matches[item["id"]] = item
+
+    return list(matches.values())
+
+
+def find_price(product_name: str, oficio: str):
+    """Compatibilidad: devuelve solo la primera coincidencia."""
+    results = find_prices(product_name, oficio)
+    return results[0] if results else None
 
 def get_delivery(delivery_id: int):
     r = supabase.table("deliveries").select("*, workers(*)").eq("id", delivery_id).execute()
@@ -483,7 +498,26 @@ async def got_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delivery["product_name"] = product_name
     oficio = delivery["oficio"]
     oficio_label = delivery["oficio_label"]
-    price_match = find_price(product_name, oficio)
+    matches = find_prices(product_name, oficio)
+
+    # CASO 1: varias coincidencias → mostrar lista para elegir
+    if len(matches) > 1:
+        context.user_data["price_matches"] = matches
+        buttons = []
+        for i, m in enumerate(matches[:10]):  # máximo 10 botones
+            label = f"{m['product_name'][:35]} — {fmt_price(m['precio_total'])}"
+            buttons.append([InlineKeyboardButton(label, callback_data=f"pick_{i}")])
+        buttons.append([InlineKeyboardButton("📐 Ninguno, medida especial", callback_data="pick_none")])
+        await update.message.reply_text(
+            f"📦 *{product_name}*\n🏷️ {oficio_label}\n\n"
+            f"Encontré {len(matches)} productos que coinciden. ¿Cuál es?",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown"
+        )
+        return PICK_PRODUCT
+
+    # CASO 2: una sola coincidencia → seguir flujo normal
+    price_match = matches[0] if matches else None
     delivery["price_match"] = price_match
 
     keyboard = InlineKeyboardMarkup([
@@ -498,13 +532,62 @@ async def got_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f"   └ *Total:  {fmt_price(price_match['precio_total'])}*")
         else:
             detalle = f"   └ *Total: {fmt_price(price_match['precio_total'])}*"
-        msg = (f"📦 *{product_name}*\n🏷️ {oficio_label}\n\n💡 Precio en lista:\n{detalle}\n\n"
+        msg = (f"📦 *{price_match['product_name']}*\n🏷️ {oficio_label}\n\n💡 Precio en lista:\n{detalle}\n\n"
                f"Paso 4️⃣ — ¿Precio de lista o medida especial?")
     else:
         msg = (f"📦 *{product_name}*\n🏷️ {oficio_label}\n\n"
                f"⚠️ No está en la lista de {oficio_label}.\n\nPaso 4️⃣ — ¿Precio de lista o medida especial?")
 
     await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
+    return PRICE_TYPE
+
+
+async def got_picked_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cuando hay varias coincidencias y el usuario elige una."""
+    query = update.callback_query
+    await query.answer()
+    delivery = context.user_data["delivery"]
+    oficio_label = delivery["oficio_label"]
+
+    if query.data == "pick_none":
+        # No coincide ninguna → ir a medida especial
+        delivery["price_match"] = None
+        await query.edit_message_text(
+            f"📐 *Medida especial*\n\n"
+            f"¿Cuánto cobras por *{delivery['product_name']}*?\n_Solo el número, ej: 85000_",
+            parse_mode="Markdown"
+        )
+        return SPECIAL_PRICE
+
+    # Usuario eligió un producto específico
+    idx = int(query.data.replace("pick_", ""))
+    matches = context.user_data.get("price_matches", [])
+    if idx >= len(matches):
+        await query.edit_message_text("⚠️ Selección inválida. Usa /cancelar y vuelve a intentar.")
+        return ConversationHandler.END
+
+    chosen = matches[idx]
+    delivery["price_match"] = chosen
+    delivery["product_name"] = chosen["product_name"]  # actualizar al nombre real
+
+    oficio = delivery["oficio"]
+    if oficio == "corte_costura" and chosen.get("precio_corte"):
+        detalle = (f"   ├ Corte:   {fmt_price(chosen.get('precio_corte'))}\n"
+                  f"   ├ Costura: {fmt_price(chosen.get('precio_costura'))}\n"
+                  f"   └ *Total:  {fmt_price(chosen['precio_total'])}*")
+    else:
+        detalle = f"   └ *Total: {fmt_price(chosen['precio_total'])}*"
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋  Precio de lista", callback_data="type_standard")],
+        [InlineKeyboardButton("📐  Medida especial", callback_data="type_special")],
+    ])
+    await query.edit_message_text(
+        f"📦 *{chosen['product_name']}*\n🏷️ {oficio_label}\n\n💡 Precio en lista:\n{detalle}\n\n"
+        f"Paso 4️⃣ — ¿Precio de lista o medida especial?",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
     return PRICE_TYPE
 
 
@@ -1616,6 +1699,7 @@ def main():
             OFICIO:        [CallbackQueryHandler(got_oficio,      pattern=r"^oficio_")],
             FVE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, got_fve)],
             PRODUCT_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_product_name)],
+            PICK_PRODUCT:  [CallbackQueryHandler(got_picked_product, pattern=r"^pick_")],
             PRICE_TYPE:    [CallbackQueryHandler(got_price_type,  pattern=r"^type_")],
             SPECIAL_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_special_price)],
             PHOTO:         [MessageHandler(filters.PHOTO, got_photo)],
