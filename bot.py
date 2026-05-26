@@ -167,6 +167,43 @@ Pregunta: {question}"""
         return "⚠️ No pude procesar tu pregunta en este momento."
 
 
+async def ask_gemini_audio(audio_bytes: bytes, user_name: str, mime_type: str = "audio/ogg") -> str:
+    """Envía audio a Gemini para que lo transcriba y responda con base en el contexto."""
+    if not GEMINI_API_KEY:
+        return "⚠️ La clave de Gemini no está configurada."
+    try:
+        import base64
+        context = get_context_data()
+        prompt = f"""Eres el asistente del sistema de producción de Livinghouse.
+El usuario te envió una nota de voz. Primero transcribe MENTALMENTE el audio en español, 
+luego responde su pregunta basándote ÚNICAMENTE en los datos que se proporcionan.
+Responde en español, claro y conciso, con emojis apropiados.
+
+Quien pregunta: {user_name}
+
+{context}
+
+Instrucción: Escucha el audio, entiende lo que pregunta el usuario, y respóndele directamente
+con base en los datos. No incluyas la transcripción literal, solo la respuesta."""
+
+        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}}
+                ]
+            }]
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        response = http_requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        logger.error(f"Error con Gemini audio: {e}")
+        return "⚠️ No pude procesar tu nota de voz en este momento."
+
+
 # ═══════════════════════════════════════════════════════════════
 # /START
 # ═══════════════════════════════════════════════════════════════
@@ -568,6 +605,28 @@ async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"🤖 {respuesta}", parse_mode="Markdown")
 
 
+async def handle_voice_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recibe notas de voz de verificadores y responde con IA."""
+    if not is_verifier(update.effective_user.id):
+        return
+
+    voice = update.message.voice
+    if not voice:
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await file.download_as_bytearray()
+        mime_type = voice.mime_type or "audio/ogg"
+        respuesta = await ask_gemini_audio(bytes(audio_bytes), update.effective_user.first_name, mime_type)
+        await update.message.reply_text(f"🤖 {respuesta}", parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error procesando audio: {e}")
+        await update.message.reply_text("⚠️ No pude procesar la nota de voz.")
+
+
 # ═══════════════════════════════════════════════════════════════
 # /MISTOTAL
 # ═══════════════════════════════════════════════════════════════
@@ -714,6 +773,7 @@ def main():
     app.add_handler(CommandHandler("precios",    precios))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice_question))
 
     logger.info("🏭 Bot Livinghouse iniciado y escuchando...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
