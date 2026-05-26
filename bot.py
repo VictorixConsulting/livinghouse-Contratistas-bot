@@ -699,7 +699,11 @@ async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text_lower = text.lower()
     es_pregunta = any(kw in text_lower for kw in palabras_clave) or "?" in text
 
-    if not es_pregunta:
+    # Si parece flujo de verificación específico, pasarlo a handle_verifier_text
+    # Si no, dejar que la IA responda a todo
+    if not es_pregunta and len(text) < 30 and any(
+        kw in text_lower for kw in ["rechaz", "aprob", "modific"]
+    ):
         await handle_verifier_text(update, context)
         return
 
