@@ -1,5 +1,5 @@
 """
-LIVINGHOUSE · BOT DE CONTROL DE PRODUCCIÓN
+LIVINGHOUSE · BOT DE CONTROL DE PRODUCCIÓN V2
 ==========================================
 Oficios soportados: corte_costura, tapiceria, pintura, esqueleteria, carpinteria
 """
