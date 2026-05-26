@@ -33,6 +33,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -144,6 +145,48 @@ def get_context_data() -> str:
         return "No se pudo obtener datos de la base de datos."
 
 
+async def ask_openrouter(question: str, user_name: str) -> str:
+    """Llama a OpenRouter con DeepSeek (gratis)."""
+    if not OPENROUTER_API_KEY:
+        return None
+    try:
+        context = get_context_data()
+        system = (
+            "Eres el asistente inteligente del sistema de producción de Livinghouse, "
+            "una fábrica de muebles en Manizales, Colombia. Responde preguntas sobre "
+            "producción, contratistas, entregas y pagos basándote ÚNICAMENTE en los "
+            "datos proporcionados. Responde en español, claro y conciso. Usa emojis "
+            "apropiados.\n\n"
+            f"Quien pregunta: {user_name}\n\n{context}"
+        )
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://livinghouse.bot",
+            "X-Title": "Livinghouse Bot",
+        }
+        payload = {
+            "model": "deepseek/deepseek-chat-v3-0324:free",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": question},
+            ],
+        }
+        logger.info("ask_openrouter: llamando...")
+        response = http_requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers, json=payload, timeout=60
+        )
+        logger.info(f"ask_openrouter: response status = {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"ask_openrouter: respuesta no-200: {response.text[:800]}")
+            return None
+        return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Error con OpenRouter: {type(e).__name__}: {e}")
+        return None
+
+
 async def ask_claude(question: str, user_name: str) -> str:
     """Llama a la API de Claude (Anthropic) con el contexto de Livinghouse."""
     logger.info(f"ask_claude: ANTHROPIC_API_KEY presente = {bool(ANTHROPIC_API_KEY)}")
@@ -188,7 +231,13 @@ async def ask_claude(question: str, user_name: str) -> str:
 
 
 async def ask_gemini(question: str, user_name: str) -> str:
-    # Probar Gemini primero (más barato)
+    # Probar OpenRouter (DeepSeek gratis) primero
+    if OPENROUTER_API_KEY:
+        result = await ask_openrouter(question, user_name)
+        if result is not None:
+            return result
+
+    # Si OpenRouter falla, probar Gemini
     if GEMINI_API_KEY:
         try:
             context = get_context_data()
