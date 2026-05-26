@@ -245,7 +245,7 @@ async def ask_openrouter(question: str, user_name: str) -> str:
             "X-Title": "Livinghouse Bot",
         }
         payload = {
-            "model": "deepseek/deepseek-r1:free",
+            "model": "openrouter/free",
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": question},
@@ -741,6 +741,20 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
 # HANDLER IA — TEXTO LIBRE DE VERIFICADORES
 # ═══════════════════════════════════════════════════════════════
 
+async def send_ai_response(update: Update, respuesta: str):
+    """Envía la respuesta de la IA. Intenta con Markdown; si falla, manda texto plano."""
+    texto = f"🤖 {respuesta}" if respuesta else "⚠️ No pude procesar tu pregunta en este momento."
+    try:
+        await update.message.reply_text(texto, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Reintentando sin Markdown: {e}")
+        try:
+            await update.message.reply_text(texto)
+        except Exception as e2:
+            logger.error(f"Error enviando respuesta: {e2}")
+            await update.message.reply_text("⚠️ La respuesta no se pudo mostrar correctamente. Intenta de nuevo.")
+
+
 async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_verifier(update.effective_user.id):
         return
@@ -774,7 +788,7 @@ async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     respuesta = await ask_gemini(text, update.effective_user.first_name)
-    await update.message.reply_text(f"🤖 {respuesta}", parse_mode="Markdown")
+    await send_ai_response(update, respuesta)
 
 
 async def handle_voice_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,7 +807,7 @@ async def handle_voice_question(update: Update, context: ContextTypes.DEFAULT_TY
         audio_bytes = await file.download_as_bytearray()
         mime_type = voice.mime_type or "audio/ogg"
         respuesta = await ask_gemini_audio(bytes(audio_bytes), update.effective_user.first_name, mime_type)
-        await update.message.reply_text(f"🤖 {respuesta}", parse_mode="Markdown")
+        await send_ai_response(update, respuesta)
     except Exception as e:
         logger.error(f"Error procesando audio: {e}")
         await update.message.reply_text("⚠️ No pude procesar la nota de voz.")
