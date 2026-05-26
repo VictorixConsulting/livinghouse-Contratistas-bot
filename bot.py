@@ -32,6 +32,7 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -143,9 +144,52 @@ def get_context_data() -> str:
         return "No se pudo obtener datos de la base de datos."
 
 
+async def ask_claude(question: str, user_name: str) -> str:
+    """Llama a la API de Claude (Anthropic) con el contexto de Livinghouse."""
+    if not ANTHROPIC_API_KEY:
+        return None  # señal para probar Gemini
+    try:
+        context = get_context_data()
+        system = (
+            "Eres el asistente inteligente del sistema de producción de Livinghouse, "
+            "una fábrica de muebles en Manizales, Colombia. Responde preguntas sobre "
+            "producción, contratistas, entregas y pagos basándote ÚNICAMENTE en los "
+            "datos proporcionados. Responde en español, claro y conciso. Usa emojis "
+            "apropiados.\n\n"
+            f"Quien pregunta: {user_name}\n\n{context}"
+        )
+        headers = {
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": question}],
+        }
+        response = http_requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers=headers, json=payload, timeout=30
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data["content"][0]["text"]
+    except Exception as e:
+        logger.error(f"Error con Claude: {e}")
+        return "⚠️ No pude procesar tu pregunta en este momento."
+
+
 async def ask_gemini(question: str, user_name: str) -> str:
+    # Si hay clave de Claude, usar Claude primero
+    if ANTHROPIC_API_KEY:
+        result = await ask_claude(question, user_name)
+        if result is not None:
+            return result
+    # Si no, usar Gemini
     if not GEMINI_API_KEY:
-        return "⚠️ La clave de Gemini no está configurada."
+        return "⚠️ No hay ninguna clave de IA configurada (ni Claude ni Gemini)."
     try:
         context = get_context_data()
         prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
