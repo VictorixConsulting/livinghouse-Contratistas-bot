@@ -166,7 +166,7 @@ async def ask_openrouter(question: str, user_name: str) -> str:
             "X-Title": "Livinghouse Bot",
         }
         payload = {
-            "model": "deepseek/deepseek-v4-flash:free",
+            "model": "deepseek/deepseek-r1:free",
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": question},
@@ -251,7 +251,7 @@ Quien pregunta: {user_name}
 
 Pregunta: {question}"""
 
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={GEMINI_API_KEY}"
             logger.info(f"ask_gemini: llamando, prompt tiene {len(prompt)} caracteres")
             response = http_requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
             logger.info(f"ask_gemini: response status = {response.status_code}")
