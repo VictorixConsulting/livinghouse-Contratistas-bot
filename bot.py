@@ -845,8 +845,9 @@ def main():
         handle_verification, pattern=r"^(approve|reject|modify)_"
     ))
 
+    # Texto libre: primero intenta IA para verificadores, luego flujo normal
     app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_verifier_text
+        filters.TEXT & ~filters.COMMAND, handle_ai_question
     ))
 
     logger.info("🏭 Bot Livinghouse iniciado y escuchando...")
@@ -855,3 +856,155 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ═══════════════════════════════════════════════════════════════
+# ASISTENTE IA — GEMINI
+# ═══════════════════════════════════════════════════════════════
+
+from google import genai as google_genai
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+def get_context_data() -> str:
+    """Obtiene datos actuales de Supabase para darle contexto a Gemini."""
+    try:
+        # Entregas de los últimos 30 días
+        since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        deliveries = supabase.table("deliveries")\
+            .select("*, workers(name)")\
+            .gte("created_at", since)\
+            .order("created_at", desc=True)\
+            .execute().data
+
+        workers = supabase.table("workers")\
+            .select("*").eq("activo", True).execute().data
+
+        # Formatear entregas para el contexto
+        lines = ["=== DATOS DE PRODUCCIÓN LIVINGHOUSE (últimos 30 días) ===\n"]
+        
+        # Resumen por contratista
+        resumen_workers = {}
+        for d in deliveries:
+            nombre = d.get("workers", {}).get("name", "Desconocido")
+            if nombre not in resumen_workers:
+                resumen_workers[nombre] = {"total": 0, "cantidad": 0, "aprobadas": 0}
+            resumen_workers[nombre]["cantidad"] += 1
+            if d["status"] == "approved":
+                resumen_workers[nombre]["total"] += float(d.get("final_price", 0))
+                resumen_workers[nombre]["aprobadas"] += 1
+
+        lines.append("RESUMEN POR CONTRATISTA:")
+        for nombre, datos in resumen_workers.items():
+            lines.append(f"  - {nombre}: {datos['cantidad']} entregas ({datos['aprobadas']} aprobadas), total aprobado: ${datos['total']:,.0f}")
+
+        # Entregas recientes
+        lines.append("\nÚLTIMAS 20 ENTREGAS:")
+        for d in deliveries[:20]:
+            nombre = d.get("workers", {}).get("name", "?")
+            fecha = d["created_at"][:10]
+            oficio = ""
+            if d.get("notes") and "Oficio:" in str(d.get("notes", "")):
+                oficio = d["notes"].replace("Oficio: ", "")
+            lines.append(
+                f"  - {fecha} | {nombre} | {d['product_name'][:40]} | "
+                f"{oficio} | ${float(d.get('final_price',0)):,.0f} | {d['status']}"
+            )
+
+        # Pendientes
+        pendientes = [d for d in deliveries if d["status"] == "pending"]
+        lines.append(f"\nENTREGAS PENDIENTES DE APROBACIÓN: {len(pendientes)}")
+        for d in pendientes[:5]:
+            nombre = d.get("workers", {}).get("name", "?")
+            lines.append(f"  - {nombre} | {d['product_name'][:40]} | ${float(d.get('final_price',0)):,.0f}")
+
+        # Contratistas registrados
+        lines.append(f"\nCONTRATISTAS REGISTRADOS ({len(workers)}):")
+        for w in workers:
+            lines.append(f"  - {w['name']} (ID: {w['id']})")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Error obteniendo contexto: {e}")
+        return "No se pudo obtener datos de la base de datos."
+
+
+async def ask_gemini(question: str, user_name: str) -> str:
+    """Envía una pregunta a Gemini con el contexto de los datos de Livinghouse."""
+    if not GEMINI_API_KEY:
+        return "⚠️ La clave de Gemini no está configurada."
+
+    try:
+        context = get_context_data()
+        
+        system_prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
+una fábrica de muebles en Manizales, Colombia.
+
+Tu trabajo es responder preguntas sobre producción, contratistas, entregas y pagos 
+basándote ÚNICAMENTE en los datos que te proporcionan. Responde en español, 
+de forma clara y concisa. Usa emojis apropiados. Si no tienes los datos para 
+responder algo, dilo claramente.
+
+Quien pregunta: {user_name}
+
+{context}"""
+
+        client = google_genai.Client(api_key=GEMINI_API_KEY)
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"{system_prompt}\n\nPregunta: {question}"
+        )
+        return response.text
+
+    except Exception as e:
+        logger.error(f"Error con Gemini: {e}")
+        return f"⚠️ No pude procesar tu pregunta. Error: {str(e)[:100]}"
+
+
+async def handle_ai_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Maneja preguntas en lenguaje natural de verificadores."""
+    if not is_verifier(update.effective_user.id):
+        return  # Solo verificadores
+
+    text = update.message.text.strip()
+    
+    # Ignorar si parece un comando o respuesta a flujo de verificación
+    if text.startswith("/"):
+        return
+    if "pending_rejection" in context.user_data or "pending_modification" in context.user_data:
+        await handle_verifier_text(update, context)
+        return
+
+    # Si el mensaje parece una pregunta o consulta, responder con IA
+    palabras_clave = [
+        "cuánto", "cuanto", "cuál", "cual", "quién", "quien",
+        "qué", "que", "cómo", "como", "cuántos", "cuantos",
+        "muéstrame", "muestrame", "dame", "dime", "lista",
+        "resumen", "total", "semana", "quincena", "mes",
+        "pendiente", "aprobad", "rechazad", "contratista",
+        "joselyn", "cuántas", "cuantas", "hoy", "ayer",
+        "producto", "entrega", "precio", "oficio"
+    ]
+    
+    text_lower = text.lower()
+    es_pregunta = any(kw in text_lower for kw in palabras_clave) or "?" in text
+
+    if not es_pregunta:
+        await handle_verifier_text(update, context)
+        return
+
+    # Mostrar "escribiendo..."
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action="typing"
+    )
+
+    user_name = update.effective_user.first_name
+    respuesta = await ask_gemini(text, user_name)
+
+    await update.message.reply_text(
+        f"🤖 {respuesta}",
+        parse_mode="Markdown"
+    )
