@@ -187,8 +187,16 @@ def build_system_prompt(user_name: str, context: str) -> str:
         f"Estás hablando con {user_name}, quien tiene acceso administrativo al sistema (es dueño o verificador, "
         f"con permisos completos sobre el bot). NUNCA le digas que contacte a otro encargado: él ES el encargado.\n\n"
         "TU ROL:\n"
-        "Responder con calidez, claridad y brevedad en español. Usa emojis con moderación (no saludes repetidamente "
-        "en la misma conversación). Si una solicitud requiere una acción del sistema, sugiere el comando exacto.\n\n"
+        "Responder con calidez, claridad y brevedad en español. Usa emojis con moderación.\n\n"
+        "⚠️ REGLA CRÍTICA — NO INVENTAR:\n"
+        "NUNCA simules, supongas o inventes que se ejecutó una acción del sistema. "
+        "TÚ NO puedes reportar entregas, registrar pagos, aprobar nada, ni modificar la base de datos. "
+        "Solo el flujo guiado de comandos del bot puede hacer eso. "
+        "Si el usuario dice algo como 'reportar', 'quiero reportar', 'pagar', 'pago', 'aprobar', etc. "
+        "sin usar el comando con barra (/), tu trabajo es SUGERIRLE el comando correcto "
+        "(ej: 'Para reportar una entrega, usa el comando /reportar'). "
+        "NO inventes detalles del trabajo, ni nombres, ni datos como si la acción ya hubiera ocurrido. "
+        "NUNCA confirmes acciones que no se hicieron realmente.\n\n"
         "=== FLUJO COMPLETO DE PRODUCCIÓN ===\n\n"
         "1) REPORTE DEL CONTRATISTA (comando /reportar):\n"
         "   El contratista (Joselyn y otros que se vayan registrando) entra al bot y reporta una entrega terminada. "
@@ -939,49 +947,47 @@ async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════
 
 def get_pending_deliveries_for_worker(worker_id: int):
-    """Entregas aprobadas y aún no pagadas de un contratista."""
+    """Todas las entregas aprobadas de un contratista (ya no se marcan individualmente como pagadas)."""
     try:
         return supabase.table("deliveries")\
             .select("*")\
             .eq("worker_id", worker_id)\
             .eq("status", "approved")\
-            .is_("payment_id", "null")\
             .order("created_at", desc=False)\
             .execute().data or []
     except Exception as e:
-        logger.error(f"Error obteniendo entregas pendientes de pago: {e}")
+        logger.error(f"Error obteniendo entregas aprobadas: {e}")
         return []
 
 
-def get_previous_balance(worker_id: int) -> float:
-    """Saldo pendiente del último corte de cobro de un contratista."""
+def get_total_pagado(worker_id: int) -> float:
+    """Suma de todo lo que se le ha pagado a un contratista históricamente."""
     try:
-        last = supabase.table("payments")\
-            .select("saldo_pendiente")\
+        pagos = supabase.table("payments")\
+            .select("monto_pagado")\
             .eq("worker_id", worker_id)\
-            .order("created_at", desc=True)\
-            .limit(1)\
-            .execute().data
-        if last:
-            return float(last[0].get("saldo_pendiente", 0) or 0)
-        return 0.0
+            .execute().data or []
+        return sum(float(p.get("monto_pagado", 0) or 0) for p in pagos)
     except Exception as e:
-        logger.error(f"Error obteniendo saldo previo: {e}")
+        logger.error(f"Error sumando pagos: {e}")
         return 0.0
 
 
 def get_cuenta_actual(worker_id: int):
-    """Resumen de la cuenta de cobro actual de un contratista.
-    Retorna: {entregas, total_entregas, saldo_previo, total_a_cobrar}
+    """Resumen de la cuenta de cobro actual.
+    Saldo = total facturado (todas las entregas aprobadas) - total pagado.
+    Retorna: {entregas, total_entregas, total_pagado, total_a_cobrar}
     """
     entregas = get_pending_deliveries_for_worker(worker_id)
     total_entregas = sum(float(d.get("final_price", 0) or 0) for d in entregas)
-    saldo_previo = get_previous_balance(worker_id)
+    total_pagado = get_total_pagado(worker_id)
+    total_a_cobrar = max(0.0, total_entregas - total_pagado)
     return {
         "entregas": entregas,
         "total_entregas": total_entregas,
-        "saldo_previo": saldo_previo,
-        "total_a_cobrar": total_entregas + saldo_previo,
+        "total_pagado": total_pagado,
+        "saldo_previo": 0.0,  # ya no se usa, se mantiene para compatibilidad
+        "total_a_cobrar": total_a_cobrar,
     }
 
 
@@ -1053,19 +1059,16 @@ async def pagar_got_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pay_cuenta"] = cuenta
 
     detalle = f"💼 *Cuenta de cobro de {worker['name']}*\n\n"
-    if cuenta["saldo_previo"] > 0:
-        detalle += f"📌 Saldo arrastrado anterior: {fmt_price(cuenta['saldo_previo'])}\n"
-    detalle += f"📦 Entregas aprobadas sin pagar: {len(cuenta['entregas'])}\n"
-    detalle += f"💵 Subtotal entregas: {fmt_price(cuenta['total_entregas'])}\n"
+    detalle += f"💵 Total facturado (entregas aprobadas): {fmt_price(cuenta['total_entregas'])}\n"
+    if cuenta["total_pagado"] > 0:
+        detalle += f"💸 Total ya pagado: {fmt_price(cuenta['total_pagado'])}\n"
     detalle += f"\n*TOTAL A COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n\n"
 
     if cuenta["entregas"]:
         detalle += "_Últimas entregas:_\n"
-        for d in cuenta["entregas"][:8]:
+        for d in cuenta["entregas"][-8:]:
             fecha = d["created_at"][:10]
             detalle += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
-        if len(cuenta["entregas"]) > 8:
-            detalle += f"  …y {len(cuenta['entregas']) - 8} más\n"
 
     detalle += f"\n¿Cuánto le vas a pagar? Escribe el monto en números (ej: `{int(cuenta['total_a_cobrar'])}` para pago total o menos para abono):"
 
@@ -1143,15 +1146,11 @@ async def pagar_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "registrado_por":  verifier["id"] if verifier else None,
         }).execute().data[0]
 
-        # Vincular todas las entregas a este pago
-        for d in cuenta["entregas"]:
-            supabase.table("deliveries").update({"payment_id": payment["id"]}).eq("id", d["id"]).execute()
-
         respuesta = (
             f"✅ *Pago registrado*\n\n"
             f"👤 {worker_name}\n"
             f"💵 Pagado: {fmt_price(monto)}\n"
-            f"📦 Entregas saldadas: {len(cuenta['entregas'])}\n"
+            f"📊 Cuenta de cobro saldada: {fmt_price(cuenta['total_a_cobrar'])}\n"
         )
         if saldo_pendiente > 0:
             respuesta += f"\n📌 Saldo pendiente arrastrado: *{fmt_price(saldo_pendiente)}*"
@@ -1185,15 +1184,14 @@ async def cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if worker:
         cuenta = get_cuenta_actual(worker["id"])
         msg = f"💼 *Tu cuenta de cobro actual*\n\n"
-        if cuenta["saldo_previo"] > 0:
-            msg += f"📌 Saldo arrastrado: {fmt_price(cuenta['saldo_previo'])}\n"
-        msg += f"📦 Entregas aprobadas sin pagar: {len(cuenta['entregas'])}\n"
-        msg += f"💵 Subtotal entregas: {fmt_price(cuenta['total_entregas'])}\n"
+        msg += f"💵 Total facturado: {fmt_price(cuenta['total_entregas'])}\n"
+        if cuenta["total_pagado"] > 0:
+            msg += f"💸 Ya recibido: {fmt_price(cuenta['total_pagado'])}\n"
         msg += f"\n*TOTAL POR COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n"
 
         if cuenta["entregas"]:
-            msg += "\n_Detalle de entregas:_\n"
-            for d in cuenta["entregas"][:10]:
+            msg += "\n_Últimas entregas:_\n"
+            for d in cuenta["entregas"][-10:]:
                 fecha = d["created_at"][:10]
                 msg += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
 
@@ -1213,10 +1211,10 @@ async def cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c = w["cuenta"]
             total_general += c["total_a_cobrar"]
             msg += f"👤 *{w['name']}*\n"
-            if c["saldo_previo"] > 0:
-                msg += f"   Saldo arrastrado: {fmt_price(c['saldo_previo'])}\n"
-            msg += f"   Entregas: {len(c['entregas'])} — Subtotal: {fmt_price(c['total_entregas'])}\n"
-            msg += f"   *Total a cobrar: {fmt_price(c['total_a_cobrar'])}*\n\n"
+            msg += f"   Facturado: {fmt_price(c['total_entregas'])}"
+            if c["total_pagado"] > 0:
+                msg += f" — Pagado: {fmt_price(c['total_pagado'])}"
+            msg += f"\n   *Por cobrar: {fmt_price(c['total_a_cobrar'])}*\n\n"
 
         msg += f"━━━━━━━━━━━━━━━━━\n*Total general por pagar: {fmt_price(total_general)}*"
         await update.message.reply_text(msg, parse_mode="Markdown")
