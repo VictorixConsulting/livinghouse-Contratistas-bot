@@ -4,16 +4,18 @@ LIVINGHOUSE · BOT DE CONTROL DE PRODUCCIÓN
 Bot de Telegram para gestionar entregas de contratistas,
 verificación de productos y generación de cuentas de cobro.
 
-Comandos:
+Oficios soportados: costura, corte, tapiceria, pintura, esqueleteria, carpinteria
+
+Comandos contratistas:
   /start      - Registrar / ver bienvenida
   /reportar   - Registrar un producto terminado
   /mistotal   - Ver acumulado de la semana actual
   /cancelar   - Cancelar reporte en curso
 
-Solo verificadores (Cindy / Juan David):
+Solo verificadores:
   /resumen [nombre] [semana|quincena] - Ver cuenta de cobro
   /pendientes                          - Ver entregas sin aprobar
-  /precios                             - Ver lista de precios
+  /precios                             - Buscar precios
 """
 
 import os
@@ -46,11 +48,17 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Estados de la conversación /reportar
-FVE, PRODUCT_NAME, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(5)
+# Oficios disponibles
+OFICIOS = {
+    "corte_costura": "✂️ Corte y Costura",
+    "tapiceria":     "🛋️ Tapicería",
+    "carpinteria":   "🪚 Carpintería",
+    "esqueleteria":  "🔧 Esqueletería",
+    "pintura":       "🎨 Pintura",
+}
 
-# Estados para el rechazo (verifiers)
-REJECTION_REASON, MODIFIED_PRICE = range(10, 12)
+# Estados de la conversación /reportar
+OFICIO, FVE, PRODUCT_NAME, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(6)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -73,19 +81,21 @@ def get_verifier(telegram_id: int):
     r = supabase.table("verifiers").select("*").eq("telegram_id", telegram_id).execute()
     return r.data[0] if r.data else None
 
-def find_price(product_name: str):
-    """Busca el precio más parecido en la lista maestra."""
-    # Primero búsqueda exacta
+def find_price(product_name: str, oficio: str):
+    """Busca el precio más parecido en la lista maestra para el oficio dado."""
+    # Búsqueda exacta con oficio
     r = supabase.table("price_list").select("*").eq("active", True)\
+        .eq("oficio", oficio)\
         .ilike("product_name", product_name).execute()
     if r.data:
         return r.data[0]
-    # Búsqueda parcial con las primeras palabras clave
-    keywords = product_name.split()[:3]
+    # Búsqueda parcial
+    keywords = product_name.upper().split()
     for kw in keywords:
         if len(kw) < 4:
             continue
         r = supabase.table("price_list").select("*").eq("active", True)\
+            .eq("oficio", oficio)\
             .ilike("product_name", f"%{kw}%").execute()
         if r.data:
             return r.data[0]
@@ -112,7 +122,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if worker:
         await update.message.reply_text(
             f"👋 ¡Hola *{worker['name']}*!\n\n"
-            f"🏭 Área: {worker['area'].capitalize()}\n\n"
+            f"🏭 Área: {worker.get('area', 'Sin área').capitalize()}\n\n"
             f"*¿Qué puedes hacer?*\n"
             f"• /reportar — registrar un producto terminado\n"
             f"• /mistotal — ver tu acumulado semanal\n"
@@ -126,7 +136,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*¿Qué puedes hacer?*\n"
             f"• /pendientes — ver entregas sin aprobar\n"
             f"• /resumen [nombre] [semana|quincena]\n"
-            f"• /precios — ver lista de precios\n\n"
+            f"• /precios [término] — buscar precios\n\n"
             f"Recibirás notificaciones automáticas cuando un contratista reporte.",
             parse_mode="Markdown"
         )
@@ -160,13 +170,37 @@ async def reportar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["worker"] = worker
     context.user_data["delivery"] = {}
 
+    # Mostrar teclado de oficios
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"oficio_{key}")]
+        for key, label in OFICIOS.items()
+    ])
+
     await update.message.reply_text(
         "📦 *Nuevo reporte de producto terminado*\n\n"
-        "Paso 1️⃣ — ¿Cuál es el número de *FVE u ODP*?\n\n"
-        "_Ejemplo: FVE 2118 o escribe sin la sigla_\n\n"
+        "Paso 1️⃣ — ¿Qué *oficio* realizaste en este producto?\n\n"
         "Envía /cancelar para salir.",
         parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=keyboard
+    )
+    return OFICIO
+
+
+async def got_oficio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    oficio_key = query.data.replace("oficio_", "")
+    oficio_label = OFICIOS.get(oficio_key, oficio_key)
+    context.user_data["delivery"]["oficio"] = oficio_key
+    context.user_data["delivery"]["oficio_label"] = oficio_label
+
+    await query.edit_message_text(
+        f"✅ Oficio: *{oficio_label}*\n\n"
+        f"Paso 2️⃣ — ¿Cuál es el número de *FVE u ODP*?\n\n"
+        f"_Ejemplo: FVE 2118 o escribe sin la sigla_\n\n"
+        f"Envía /cancelar para salir.",
+        parse_mode="Markdown"
     )
     return FVE
 
@@ -177,7 +211,7 @@ async def got_fve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ FVE: *{fve}*\n\n"
-        f"Paso 2️⃣ — ¿Cuál es el *nombre del producto*?\n\n"
+        f"Paso 3️⃣ — ¿Cuál es el *nombre del producto*?\n\n"
         f"_Ejemplo: Sofa Cama Montreal Tipo 2_",
         parse_mode="Markdown"
     )
@@ -186,10 +220,13 @@ async def got_fve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def got_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     product_name = update.message.text.strip()
-    context.user_data["delivery"]["product_name"] = product_name
+    delivery = context.user_data["delivery"]
+    delivery["product_name"] = product_name
 
-    price_match = find_price(product_name)
-    context.user_data["delivery"]["price_match"] = price_match
+    oficio = delivery["oficio"]
+    oficio_label = delivery["oficio_label"]
+    price_match = find_price(product_name, oficio)
+    delivery["price_match"] = price_match
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📋  Precio de lista",  callback_data="type_standard")],
@@ -197,19 +234,29 @@ async def got_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if price_match:
+        # Para corte_costura mostrar desglose, para otros solo total
+        if oficio == "corte_costura" and price_match.get("precio_corte"):
+            precio_detalle = (
+                f"   ├ Corte:   {fmt_price(price_match.get('precio_corte'))}\n"
+                f"   ├ Costura: {fmt_price(price_match.get('precio_costura'))}\n"
+                f"   └ *Total:  {fmt_price(price_match['precio_total'])}*"
+            )
+        else:
+            precio_detalle = f"   └ *Total: {fmt_price(price_match['precio_total'])}*"
+
         msg = (
-            f"📦 Producto: *{product_name}*\n\n"
+            f"📦 Producto: *{product_name}*\n"
+            f"🏷️ Oficio: {oficio_label}\n\n"
             f"💡 Encontré en la lista de precios:\n"
-            f"   ├ Corte:   {fmt_price(price_match.get('precio_corte'))}\n"
-            f"   ├ Costura: {fmt_price(price_match.get('precio_costura'))}\n"
-            f"   └ *Total:  {fmt_price(price_match['precio_total'])}*\n\n"
-            f"Paso 3️⃣ — ¿Es precio de lista o medida especial?"
+            f"{precio_detalle}\n\n"
+            f"Paso 4️⃣ — ¿Es precio de lista o medida especial?"
         )
     else:
         msg = (
-            f"📦 Producto: *{product_name}*\n\n"
-            f"⚠️ Este producto *no está en la lista de precios*.\n\n"
-            f"Paso 3️⃣ — ¿Es precio de lista o medida especial?"
+            f"📦 Producto: *{product_name}*\n"
+            f"🏷️ Oficio: {oficio_label}\n\n"
+            f"⚠️ Este producto *no está en la lista* de {oficio_label}.\n\n"
+            f"Paso 4️⃣ — ¿Es precio de lista o medida especial?"
         )
 
     await update.message.reply_text(msg, reply_markup=keyboard, parse_mode="Markdown")
@@ -220,7 +267,7 @@ async def got_price_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    choice = query.data  # "type_standard" o "type_special"
+    choice = query.data
     delivery = context.user_data["delivery"]
     price_match = delivery.get("price_match")
 
@@ -231,7 +278,7 @@ async def got_price_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
             delivery["price_list_id"] = price_match["id"]
             await query.edit_message_text(
                 f"✅ Precio de lista aplicado: *{fmt_price(price_match['precio_total'])}*\n\n"
-                f"Paso 4️⃣ — Envía la *foto del producto terminado* 📸\n\n"
+                f"Paso 5️⃣ — Envía la *foto del producto terminado* 📸\n\n"
                 f"_(La foto es la prueba visual de entrega)_",
                 parse_mode="Markdown"
             )
@@ -276,7 +323,7 @@ async def got_special_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"💰 Precio solicitado: *{fmt_price(price)}*\n\n"
-        f"Paso 4️⃣ — Ahora envía la *foto del producto terminado* 📸\n\n"
+        f"Paso 5️⃣ — Ahora envía la *foto del producto terminado* 📸\n\n"
         f"_(La foto es la prueba visual de entrega)_",
         parse_mode="Markdown"
     )
@@ -291,29 +338,30 @@ async def got_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     delivery = context.user_data["delivery"]
     worker   = context.user_data["worker"]
 
-    photo      = update.message.photo[-1]   # la de mayor resolución
-    is_special = delivery.get("is_special", False)
+    photo       = update.message.photo[-1]
+    is_special  = delivery.get("is_special", False)
     final_price = delivery["final_price"]
+    oficio      = delivery.get("oficio", "")
+    oficio_label = delivery.get("oficio_label", oficio)
 
-    # ── Guardar en base de datos ──
     file = await context.bot.get_file(photo.file_id)
     record = {
-        "worker_id":      worker["id"],
-        "fve":            delivery["fve"],
-        "product_name":   delivery["product_name"],
-        "price_list_id":  delivery.get("price_list_id"),
-        "is_special":     is_special,
+        "worker_id":       worker["id"],
+        "fve":             delivery["fve"],
+        "product_name":    delivery["product_name"],
+        "price_list_id":   delivery.get("price_list_id"),
+        "is_special":      is_special,
         "requested_price": delivery.get("requested_price"),
-        "final_price":    final_price,
-        "photo_file_id":  photo.file_id,
-        "photo_url":      file.file_path,
-        "status":         "pending",
-        "created_at":     datetime.utcnow().isoformat(),
+        "final_price":     final_price,
+        "photo_file_id":   photo.file_id,
+        "photo_url":       file.file_path,
+        "status":          "pending",
+        "notes":           f"Oficio: {oficio_label}",
+        "created_at":      datetime.utcnow().isoformat(),
     }
-    result     = supabase.table("deliveries").insert(record).execute()
+    result      = supabase.table("deliveries").insert(record).execute()
     delivery_id = result.data[0]["id"]
 
-    # ── Notificar a verificadores ──
     tipo_label = (
         "🔴 *PRECIO ESPECIAL* — requiere aprobación explícita del valor"
         if is_special else
@@ -323,7 +371,8 @@ async def got_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (
         f"🏭 *NUEVA ENTREGA*\n"
         f"{'─' * 28}\n"
-        f"👷 *{worker['name']}* · {worker['area'].capitalize()}\n"
+        f"👷 *{worker['name']}*\n"
+        f"🏷️ Oficio: {oficio_label}\n"
         f"📋 FVE:      `{delivery['fve']}`\n"
         f"📦 Producto: *{delivery['product_name']}*\n"
         f"💰 Precio:   *{fmt_price(final_price)}*\n"
@@ -357,10 +406,10 @@ async def got_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"No se pudo notificar a {verifier['name']}: {e}")
 
-    # ── Confirmar al contratista ──
     await update.message.reply_text(
         f"✅ *¡Reporte enviado correctamente!*\n\n"
-        f"📋 FVE:      {delivery['fve']}\n"
+        f"🏷️ Oficio: {oficio_label}\n"
+        f"📋 FVE:    {delivery['fve']}\n"
         f"📦 {delivery['product_name']}\n"
         f"💰 {fmt_price(final_price)}\n\n"
         f"{'⏳ *Esperando aprobación del precio especial.*' if is_special else '⏳ Esperando confirmación de entrega.'}\n"
@@ -381,7 +430,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-# CALLBACKS DE VERIFICADORES (Aprobar / Rechazar / Modificar)
+# CALLBACKS DE VERIFICADORES
 # ═══════════════════════════════════════════════════════════════
 
 async def handle_verification(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -402,7 +451,7 @@ async def handle_verification(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not delivery:
         await query.edit_message_caption(
-            caption=query.message.caption + "\n\n⚠️ Entrega no encontrada en la base de datos.",
+            caption=query.message.caption + "\n\n⚠️ Entrega no encontrada.",
             parse_mode="Markdown"
         )
         return
@@ -415,16 +464,14 @@ async def handle_verification(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
-    # ── APROBAR ────────────────────────────────────────────────
     if action == "approve":
         supabase.table("deliveries").update({
-            "status":                "approved",
-            "approved_by":           ver_name,
+            "status":                  "approved",
+            "approved_by":             ver_name,
             "approved_by_telegram_id": query.from_user.id,
-            "approved_at":           datetime.utcnow().isoformat(),
+            "approved_at":             datetime.utcnow().isoformat(),
         }).eq("id", delivery_id).execute()
 
-        # Notificar al contratista
         worker = delivery.get("workers", {})
         try:
             await context.bot.send_message(
@@ -447,36 +494,31 @@ async def handle_verification(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown"
         )
 
-    # ── RECHAZAR ───────────────────────────────────────────────
     elif action == "reject":
         context.user_data["pending_rejection"] = delivery_id
         context.user_data["rejection_verifier"] = ver_name
+        context.user_data["rejection_chat_id"] = query.message.chat_id
         await query.edit_message_caption(
             caption=query.message.caption + f"\n\n{'─'*28}\n❌ Rechazando...\nEscribe el *motivo del rechazo* en el chat:",
             parse_mode="Markdown"
         )
-        # Guardamos el chat_id del mensaje para editarlo después
-        context.user_data["rejection_chat_id"] = query.message.chat_id
 
-    # ── MODIFICAR PRECIO ───────────────────────────────────────
     elif action == "modify":
         context.user_data["pending_modification"] = delivery_id
         context.user_data["mod_verifier"] = ver_name
+        context.user_data["mod_chat_id"] = query.message.chat_id
         await query.edit_message_caption(
-            caption=query.message.caption + f"\n\n{'─'*28}\n✏️ Escribe en el chat el *precio que apruebas*\n(solo el número, ej: 95000):",
+            caption=query.message.caption + f"\n\n{'─'*28}\n✏️ Escribe el *precio que apruebas*\n(solo el número, ej: 95000):",
             parse_mode="Markdown"
         )
-        context.user_data["mod_chat_id"] = query.message.chat_id
 
 
 async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Captura texto libre de los verificadores para rechazo o modificación de precio."""
     if not is_verifier(update.effective_user.id):
-        return  # No es un verificador, ignorar
+        return
 
     user_data = context.user_data
 
-    # ── Motivo de rechazo ──────────────────────────────────────
     if "pending_rejection" in user_data:
         delivery_id = user_data.pop("pending_rejection")
         ver_name    = user_data.pop("rejection_verifier", update.effective_user.first_name)
@@ -484,14 +526,13 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
         delivery = get_delivery(delivery_id)
         supabase.table("deliveries").update({
-            "status":                "rejected",
-            "rejection_reason":      reason,
-            "approved_by":           ver_name,
+            "status":                  "rejected",
+            "rejection_reason":        reason,
+            "approved_by":             ver_name,
             "approved_by_telegram_id": update.effective_user.id,
-            "approved_at":           datetime.utcnow().isoformat(),
+            "approved_at":             datetime.utcnow().isoformat(),
         }).eq("id", delivery_id).execute()
 
-        # Notificar al contratista
         worker = delivery.get("workers", {})
         try:
             await context.bot.send_message(
@@ -510,12 +551,10 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.error(f"No se pudo notificar al contratista: {e}")
 
         await update.message.reply_text(
-            f"❌ Entrega #{delivery_id} rechazada.\n"
-            f"Motivo registrado: _{reason}_",
+            f"❌ Entrega #{delivery_id} rechazada.\nMotivo: _{reason}_",
             parse_mode="Markdown"
         )
 
-    # ── Precio modificado ──────────────────────────────────────
     elif "pending_modification" in user_data:
         delivery_id = user_data.pop("pending_modification")
         ver_name    = user_data.pop("mod_verifier", update.effective_user.first_name)
@@ -524,24 +563,21 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             new_price = float(raw)
         except ValueError:
-            await update.message.reply_text(
-                "❌ No entendí ese precio. Escribe solo el número, ej: 95000"
-            )
+            await update.message.reply_text("❌ No entendí ese precio. Escribe solo el número, ej: 95000")
             user_data["pending_modification"] = delivery_id
             user_data["mod_verifier"] = ver_name
             return
 
         delivery = get_delivery(delivery_id)
         supabase.table("deliveries").update({
-            "status":                "approved",
-            "final_price":           new_price,
-            "approved_by":           ver_name,
+            "status":                  "approved",
+            "final_price":             new_price,
+            "approved_by":             ver_name,
             "approved_by_telegram_id": update.effective_user.id,
-            "approved_at":           datetime.utcnow().isoformat(),
-            "notes":                 f"Precio modificado por {ver_name}: {fmt_price(delivery['final_price'])} → {fmt_price(new_price)}",
+            "approved_at":             datetime.utcnow().isoformat(),
+            "notes":                   f"Precio modificado: {fmt_price(delivery['final_price'])} → {fmt_price(new_price)}",
         }).eq("id", delivery_id).execute()
 
-        # Notificar al contratista
         worker = delivery.get("workers", {})
         try:
             await context.bot.send_message(
@@ -550,7 +586,7 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
                     f"✅ *Producto aprobado con precio ajustado*\n\n"
                     f"📋 FVE: {delivery['fve']}\n"
                     f"📦 {delivery['product_name']}\n"
-                    f"💰 Precio solicitado: {fmt_price(delivery['requested_price'])}\n"
+                    f"💰 Precio solicitado: {fmt_price(delivery.get('requested_price'))}\n"
                     f"💰 *Precio aprobado: {fmt_price(new_price)}*\n"
                     f"👤 Aprobado por: *{ver_name}*"
                 ),
@@ -566,7 +602,7 @@ async def handle_verifier_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ═══════════════════════════════════════════════════════════════
-# /MISTOTAL — CONTRATISTA VE SU ACUMULADO
+# /MISTOTAL
 # ═══════════════════════════════════════════════════════════════
 
 async def mis_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -575,7 +611,6 @@ async def mis_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No estás registrado en el sistema.")
         return
 
-    # Semana en curso (lunes a hoy)
     today      = datetime.now()
     week_start = (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d")
 
@@ -601,8 +636,12 @@ async def mis_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for d in deliveries:
         label = "🔴" if d["is_special"] else "🟢"
         fecha = d["created_at"][:10]
-        lines.append(f"{label} `{d['fve']}` — {d['product_name'][:30]}")
+        oficio_info = ""
+        if d.get("notes") and "Oficio:" in d["notes"]:
+            oficio_info = f" · {d['notes'].replace('Oficio: ', '')}"
+        lines.append(f"{label} `{d['fve']}` — {d['product_name'][:30]}{oficio_info}")
         lines.append(f"   💰 {fmt_price(d['final_price'])} · {fecha}")
+
     lines.append(f"\n{'─'*28}")
     lines.append(f"💰 *TOTAL APROBADO: {fmt_price(total)}*")
     lines.append(f"📦 Productos: {len(deliveries)}")
@@ -611,7 +650,7 @@ async def mis_total(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-# /PENDIENTES — VERIFICADOR VE LO SIN APROBAR
+# /PENDIENTES
 # ═══════════════════════════════════════════════════════════════
 
 async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -635,19 +674,22 @@ async def pendientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         w     = d.get("workers", {})
         label = "🔴 ESPECIAL" if d["is_special"] else "🟢 lista"
         fecha = d["created_at"][:16].replace("T", " ")
+        oficio_info = ""
+        if d.get("notes") and "Oficio:" in str(d.get("notes", "")):
+            oficio_info = f"\n  🏷️ {d['notes']}"
         lines.append(
-            f"• *{w.get('name','?')}* ({w.get('area','?')})\n"
+            f"• *{w.get('name','?')}*\n"
             f"  `{d['fve']}` — {d['product_name'][:35]}\n"
-            f"  {fmt_price(d['final_price'])} · {label} · {fecha}\n"
+            f"  {fmt_price(d['final_price'])} · {label} · {fecha}"
+            f"{oficio_info}\n"
             f"  ID: `{d['id']}`"
         )
 
-    lines.append(f"\n_Las aprobaciones llegan automáticamente cuando el contratista reporta._")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════════════════════════
-# /RESUMEN — VERIFICADOR GENERA CUENTA DE COBRO
+# /RESUMEN
 # ═══════════════════════════════════════════════════════════════
 
 async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,7 +714,6 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     days_back   = 15 if period == "quincena" else 7
     start_date  = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
 
-    # Buscar contratista
     wr = supabase.table("workers").select("*").ilike("name", f"%{worker_name}%").execute()
     if not wr.data:
         await update.message.reply_text(f"❌ No encontré ningún contratista con nombre '{worker_name}'.")
@@ -680,7 +721,6 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     worker = wr.data[0]
 
-    # Traer entregas aprobadas del período
     r = supabase.table("deliveries").select("*")\
         .eq("worker_id", worker["id"])\
         .eq("status", "approved")\
@@ -696,7 +736,7 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         f"🧾 *CUENTA DE COBRO*",
-        f"👷 {worker['name']} · {worker['area'].capitalize()}",
+        f"👷 {worker['name']}",
         f"📅 {period_label}",
         f"{'─' * 30}",
     ]
@@ -707,13 +747,15 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for d in deliveries:
             label = "🔴" if d["is_special"] else "🟢"
             fecha = d["created_at"][:10]
-            aprobado_por = d.get("approved_by", "?")
+            oficio_info = ""
+            if d.get("notes") and "Oficio:" in str(d.get("notes", "")):
+                oficio_info = f" · {d['notes'].replace('Oficio: ', '')}"
             lines.append(
-                f"\n{label} *{d['product_name']}*\n"
+                f"\n{label} *{d['product_name']}*{oficio_info}\n"
                 f"   FVE: `{d['fve']}` · {fecha}\n"
                 f"   💰 {fmt_price(d['final_price'])}"
                 f"{' _(especial)_' if d['is_special'] else ''}\n"
-                f"   ✅ Aprobó: {aprobado_por}"
+                f"   ✅ Aprobó: {d.get('approved_by', '?')}"
             )
 
     lines.append(f"\n{'─' * 30}")
@@ -726,7 +768,7 @@ async def resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-# /PRECIOS — CONSULTAR LISTA MAESTRA
+# /PRECIOS
 # ═══════════════════════════════════════════════════════════════
 
 async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,7 +780,8 @@ async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         await update.message.reply_text(
             "🔍 Usa `/precios [término]` para buscar.\n"
-            "_Ejemplo:_ `/precios sofa cama`",
+            "_Ejemplo:_ `/precios sofa cama`\n\n"
+            "Oficios: corte\\_costura, tapiceria, carpinteria, esqueleteria, pintura",
             parse_mode="Markdown"
         )
         return
@@ -750,37 +793,42 @@ async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ No encontré precios para '{term}'.")
         return
 
-    lines = [f"📋 *Precios encontrados para '{term}'*\n"]
-    for p in r.data[:10]:  # máx 10 resultados
+    lines = [f"📋 *Precios para '{term}'*\n"]
+    for p in r.data[:12]:
+        oficio_label = OFICIOS.get(p.get("oficio", ""), p.get("oficio", ""))
+        if p.get("oficio") == "corte_costura" and p.get("precio_corte"):
+            detalle = (f"Corte: {fmt_price(p.get('precio_corte'))} · "
+                      f"Costura: {fmt_price(p.get('precio_costura'))} · ")
+        else:
+            detalle = ""
         lines.append(
             f"• *{p['product_name']}*\n"
-            f"  Corte: {fmt_price(p.get('precio_corte'))} · "
-            f"Costura: {fmt_price(p.get('precio_costura'))} · "
-            f"*Total: {fmt_price(p['precio_total'])}*"
+            f"  {oficio_label}\n"
+            f"  {detalle}*Total: {fmt_price(p['precio_total'])}*"
         )
 
-    if len(r.data) > 10:
-        lines.append(f"\n_...y {len(r.data)-10} más. Refina la búsqueda._")
+    if len(r.data) > 12:
+        lines.append(f"\n_...y {len(r.data)-12} más. Refina la búsqueda._")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN — REGISTRAR HANDLERS Y ARRANCAR
+# MAIN
 # ═══════════════════════════════════════════════════════════════
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Conversación principal: /reportar
     conv = ConversationHandler(
         entry_points=[CommandHandler("reportar", reportar_start)],
         states={
-            FVE:          [MessageHandler(filters.TEXT & ~filters.COMMAND, got_fve)],
-            PRODUCT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_product_name)],
-            PRICE_TYPE:   [CallbackQueryHandler(got_price_type, pattern=r"^type_")],
-            SPECIAL_PRICE:[MessageHandler(filters.TEXT & ~filters.COMMAND, got_special_price)],
-            PHOTO:        [MessageHandler(filters.PHOTO, got_photo)],
+            OFICIO:        [CallbackQueryHandler(got_oficio,       pattern=r"^oficio_")],
+            FVE:           [MessageHandler(filters.TEXT & ~filters.COMMAND, got_fve)],
+            PRODUCT_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_product_name)],
+            PRICE_TYPE:    [CallbackQueryHandler(got_price_type,   pattern=r"^type_")],
+            SPECIAL_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_special_price)],
+            PHOTO:         [MessageHandler(filters.PHOTO, got_photo)],
         },
         fallbacks=[CommandHandler("cancelar", cancel)],
         allow_reentry=True,
@@ -793,12 +841,10 @@ def main():
     app.add_handler(CommandHandler("resumen",    resumen))
     app.add_handler(CommandHandler("precios",    precios))
 
-    # Callbacks de verificadores (aprobar / rechazar / modificar)
     app.add_handler(CallbackQueryHandler(
         handle_verification, pattern=r"^(approve|reject|modify)_"
     ))
 
-    # Texto libre de verificadores (motivo rechazo / precio modificado)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_verifier_text
     ))
