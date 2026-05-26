@@ -188,17 +188,11 @@ async def ask_claude(question: str, user_name: str) -> str:
 
 
 async def ask_gemini(question: str, user_name: str) -> str:
-    # Si hay clave de Claude, usar Claude primero
-    if ANTHROPIC_API_KEY:
-        result = await ask_claude(question, user_name)
-        if result is not None:
-            return result
-    # Si no, usar Gemini
-    if not GEMINI_API_KEY:
-        return "⚠️ No hay ninguna clave de IA configurada (ni Claude ni Gemini)."
-    try:
-        context = get_context_data()
-        prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
+    # Probar Gemini primero (más barato)
+    if GEMINI_API_KEY:
+        try:
+            context = get_context_data()
+            prompt = f"""Eres el asistente inteligente del sistema de producción de Livinghouse, 
 una fábrica de muebles en Manizales, Colombia.
 Responde preguntas sobre producción, contratistas, entregas y pagos basándote ÚNICAMENTE 
 en los datos proporcionados. Responde en español, claro y conciso. Usa emojis apropiados.
@@ -208,13 +202,23 @@ Quien pregunta: {user_name}
 
 Pregunta: {question}"""
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        response = http_requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
-        response.raise_for_status()
-        return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    except Exception as e:
-        logger.error(f"Error con Gemini: {e}")
-        return "⚠️ No pude procesar tu pregunta en este momento."
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+            logger.info(f"ask_gemini: llamando, prompt tiene {len(prompt)} caracteres")
+            response = http_requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=30)
+            logger.info(f"ask_gemini: response status = {response.status_code}")
+            if response.status_code == 200:
+                return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            logger.error(f"ask_gemini: respuesta no-200: {response.text[:800]}")
+        except Exception as e:
+            logger.error(f"Error con Gemini: {type(e).__name__}: {e}")
+
+    # Si Gemini falla, intentar Claude como respaldo
+    if ANTHROPIC_API_KEY:
+        result = await ask_claude(question, user_name)
+        if result is not None:
+            return result
+
+    return "⚠️ No pude procesar tu pregunta en este momento."
 
 
 async def ask_gemini_audio(audio_bytes: bytes, user_name: str, mime_type: str = "audio/ogg") -> str:
