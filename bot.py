@@ -47,6 +47,7 @@ OFICIOS = {
 
 OFICIO, FVE, PRODUCT_NAME, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(6)
 PAY_WORKER, PAY_AMOUNT, PAY_CONFIRM = range(10, 13)
+CLOSE_WORKER, CLOSE_CONFIRM = range(20, 22)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -207,39 +208,36 @@ def build_system_prompt(user_name: str, context: str) -> str:
         "etc.) entonces sí respondes basándote en los DATOS REALES más abajo.\n\n"
         "=== FLUJO COMPLETO DE PRODUCCIÓN ===\n\n"
         "1) REPORTE DEL CONTRATISTA (comando /reportar):\n"
-        "   El contratista (Joselyn y otros que se vayan registrando) entra al bot y reporta una entrega terminada. "
-        "El flujo guiado por botones es:\n"
-        "   a. Selecciona su oficio (corte/costura, tapicería, carpintería, esqueletería, pintura)\n"
-        "   b. Indica la FVE (Factura de Venta a la que pertenece el trabajo)\n"
-        "   c. Escribe el nombre del producto entregado\n"
-        "   d. El bot busca el precio en la lista del oficio correspondiente. Si existe, lo asigna automáticamente. "
-        "Si no aparece, permite ingresar un precio especial.\n"
-        "   e. El contratista envía una foto del producto terminado como evidencia.\n"
-        "   f. La entrega queda en estado 'pendiente' y se notifica a los verificadores.\n\n"
+        "   El contratista reporta una entrega terminada. Selecciona oficio, FVE, producto, precio y foto. "
+        "La entrega queda 'pendiente' hasta que un verificador la apruebe.\n\n"
         "2) VERIFICACIÓN (comando /pendientes):\n"
-        "   Los verificadores (Cindy, Juan David, y otros administradores) reciben la notificación con la foto y los datos. "
-        "Pueden:\n"
-        "   • APROBAR la entrega (queda lista para cuenta de cobro)\n"
-        "   • RECHAZAR (con un motivo escrito que se envía al contratista)\n"
-        "   • MODIFICAR el precio o detalles antes de aprobar\n\n"
-        "3) ACUMULACIÓN DE CUENTA DE COBRO:\n"
-        "   Cada entrega aprobada se va sumando al saldo pendiente de pago del contratista. "
-        "Esto forma su 'cuenta de cobro' actual — lo que la fábrica le debe en este momento.\n\n"
-        "4) PAGO Y CORTE DE CUENTA (a futuro):\n"
-        "   Cuando la fábrica le paga a un contratista (por ejemplo cada quincena), un verificador debe registrar "
-        "ese pago en el sistema. Al registrarlo, todas las entregas aprobadas hasta ese momento quedan marcadas "
-        "como 'pagadas' y la cuenta de cobro del contratista se reinicia en cero. A partir de ahí, vuelve a "
-        "acumular las próximas entregas aprobadas hasta el siguiente pago. "
-        "Esta funcionalidad de registrar pagos y hacer el corte de cuenta forma parte de la siguiente fase "
-        "del sistema (el dashboard web), todavía no está implementada en el bot.\n\n"
+        "   Verificadores aprueban, rechazan o modifican entregas.\n\n"
+        "3) PRODUCCIÓN EN CURSO:\n"
+        "   Cada entrega aprobada se suma a la 'producción en curso' del contratista. "
+        "Esto NO es deuda todavía — es solo trabajo acumulado pendiente de cierre formal.\n\n"
+        "4) CIERRE DE PRODUCCIÓN (comando /cierre, solo verificadores):\n"
+        "   Cuando el verificador decide cerrar un período (semanal, quincenal, cuando quiera), "
+        "toda la producción en curso se convierte en DEUDA FORMAL. La producción en curso vuelve a cero "
+        "y empieza a acumular de nuevo. La deuda formal es lo que oficialmente se le debe al contratista.\n\n"
+        "5) PAGO (comando /pagar, solo verificadores):\n"
+        "   Los pagos SOLO se hacen sobre la deuda formal (lo ya cerrado). NO se puede pagar producción "
+        "en curso que aún no ha sido cerrada. Pueden ser pagos totales o abonos parciales. "
+        "El saldo no cubierto queda como deuda hasta el siguiente pago.\n\n"
+        "DOS CONCEPTOS CLAVE QUE NUNCA DEBES CONFUNDIR:\n"
+        "  🟢 Producción en curso = lo que va acumulado desde el último cierre (no es deuda aún)\n"
+        "  📌 Deuda formal = lo que ya fue cerrado y aún no se ha pagado (sí es lo que se le debe)\n\n"
         "COMANDOS DISPONIBLES ACTUALMENTE:\n"
-        "  • /reportar - inicia el flujo para registrar una entrega\n"
-        "  • /pendientes - lista entregas que esperan aprobación\n"
+        "  • /reportar - registrar una entrega (contratistas)\n"
+        "  • /pendientes - revisar entregas por aprobar (verificadores)\n"
         "  • /resumen - resumen general de producción\n"
-        "  • /precios - consulta la lista de precios por oficio\n"
-        "  • /cuenta - consulta el saldo actual por cobrar (contratista ve el suyo; verificador ve el de todos)\n"
-        "  • /pagar - (solo verificadores) registra un pago a un contratista, con soporte para abonos parciales\n"
-        "  • /historial - ver pagos pasados (contratista ve los suyos; verificador puede usar /historial <nombre> para ver los de alguien específico)\n\n"
+        "  • /precios - lista de precios por oficio\n"
+        "  • /cuenta - estado completo: producción en curso + deuda formal + total pagado\n"
+        "  • /produccion - producción en curso del período actual (desde último cierre)\n"
+        "  • /produccion anteriores - lista de cierres pasados con fechas y montos\n"
+        "  • /produccion <nombre> - producción en curso de un contratista específico (verificadores)\n"
+        "  • /cierre - cerrar la producción de un contratista, convirtiéndola en deuda formal (verificadores)\n"
+        "  • /pagar - pagar sobre la deuda formal (verificadores)\n"
+        "  • /historial - pagos pasados realizados\n\n"
         "Si te piden información que no está en los datos (fotos individuales, archivos, detalles fuera de los "
         "registros), reconócelo con naturalidad sin inventar. Si te saludan informalmente, responde breve "
         "y vuelve a estar disponible — no repitas la introducción completa en cada mensaje.\n\n"
@@ -954,18 +952,32 @@ async def precios(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # LÓGICA DE PAGOS Y CUENTAS DE COBRO
 # ═══════════════════════════════════════════════════════════════
 
-def get_pending_deliveries_for_worker(worker_id: int):
-    """Todas las entregas aprobadas de un contratista (ya no se marcan individualmente como pagadas)."""
+def get_produccion_en_curso(worker_id: int):
+    """Entregas aprobadas que aún NO están en un cierre. Producción acumulada en curso."""
     try:
         return supabase.table("deliveries")\
             .select("*")\
             .eq("worker_id", worker_id)\
             .eq("status", "approved")\
+            .is_("closure_id", "null")\
             .order("created_at", desc=False)\
             .execute().data or []
     except Exception as e:
-        logger.error(f"Error obteniendo entregas aprobadas: {e}")
+        logger.error(f"Error obteniendo producción en curso: {e}")
         return []
+
+
+def get_total_cerrado(worker_id: int) -> float:
+    """Suma de todos los cierres formales que ha tenido un contratista."""
+    try:
+        cierres = supabase.table("closures")\
+            .select("monto")\
+            .eq("worker_id", worker_id)\
+            .execute().data or []
+        return sum(float(c.get("monto", 0) or 0) for c in cierres)
+    except Exception as e:
+        logger.error(f"Error sumando cierres: {e}")
+        return 0.0
 
 
 def get_total_pagado(worker_id: int) -> float:
@@ -981,41 +993,205 @@ def get_total_pagado(worker_id: int) -> float:
         return 0.0
 
 
-def get_cuenta_actual(worker_id: int):
-    """Resumen de la cuenta de cobro actual.
-    Saldo = total facturado (todas las entregas aprobadas) - total pagado.
-    Retorna: {entregas, total_entregas, total_pagado, total_a_cobrar}
+def get_deuda_formal(worker_id: int) -> float:
+    """Deuda formal = total cerrado - total pagado. Es lo que oficialmente se le debe."""
+    return max(0.0, get_total_cerrado(worker_id) - get_total_pagado(worker_id))
+
+
+def get_estado_contratista(worker_id: int):
+    """Estado completo de un contratista:
+       - produccion_en_curso: entregas aprobadas aún sin cerrar
+       - total_produccion_en_curso: suma de eso
+       - deuda_formal: lo que se le debe oficialmente (ya cerrado y no pagado)
+       - total_cerrado, total_pagado
     """
-    entregas = get_pending_deliveries_for_worker(worker_id)
-    total_entregas = sum(float(d.get("final_price", 0) or 0) for d in entregas)
+    entregas = get_produccion_en_curso(worker_id)
+    total_produccion = sum(float(d.get("final_price", 0) or 0) for d in entregas)
+    total_cerrado = get_total_cerrado(worker_id)
     total_pagado = get_total_pagado(worker_id)
-    total_a_cobrar = max(0.0, total_entregas - total_pagado)
+    deuda_formal = max(0.0, total_cerrado - total_pagado)
     return {
-        "entregas": entregas,
-        "total_entregas": total_entregas,
-        "total_pagado": total_pagado,
-        "saldo_previo": 0.0,  # ya no se usa, se mantiene para compatibilidad
-        "total_a_cobrar": total_a_cobrar,
+        "produccion_en_curso":        entregas,
+        "total_produccion_en_curso":  total_produccion,
+        "total_cerrado":              total_cerrado,
+        "total_pagado":               total_pagado,
+        "deuda_formal":               deuda_formal,
     }
 
 
-def get_workers_with_pending_balance():
-    """Contratistas con entregas aprobadas sin pagar o saldo previo > 0."""
+def get_workers_with_deuda_formal():
+    """Contratistas con deuda formal > 0 (algo cerrado y aún sin pagar)."""
     try:
         all_workers = supabase.table("workers").select("*").eq("activo", True).execute().data or []
         result = []
         for w in all_workers:
-            cuenta = get_cuenta_actual(w["id"])
-            if cuenta["total_a_cobrar"] > 0:
-                result.append({**w, "cuenta": cuenta})
+            estado = get_estado_contratista(w["id"])
+            if estado["deuda_formal"] > 0:
+                result.append({**w, "estado": estado})
         return result
     except Exception as e:
-        logger.error(f"Error listando contratistas con saldo: {e}")
+        logger.error(f"Error listando contratistas con deuda: {e}")
+        return []
+
+
+def get_workers_with_produccion_en_curso():
+    """Contratistas con producción acumulada aún sin cerrar."""
+    try:
+        all_workers = supabase.table("workers").select("*").eq("activo", True).execute().data or []
+        result = []
+        for w in all_workers:
+            estado = get_estado_contratista(w["id"])
+            if estado["total_produccion_en_curso"] > 0:
+                result.append({**w, "estado": estado})
+        return result
+    except Exception as e:
+        logger.error(f"Error listando contratistas con producción: {e}")
         return []
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMANDO /pagar — registrar pago a un contratista
+# COMANDO /cierre — convertir producción en curso en deuda formal
+# ═══════════════════════════════════════════════════════════════
+
+async def cierre_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_verifier(update.effective_user.id):
+        await update.message.reply_text("⚠️ Solo los verificadores pueden hacer cierres.")
+        return ConversationHandler.END
+
+    workers = get_workers_with_produccion_en_curso()
+    if not workers:
+        await update.message.reply_text("✅ No hay contratistas con producción en curso por cerrar.")
+        return ConversationHandler.END
+
+    keyboard = []
+    for w in workers:
+        total = w["estado"]["total_produccion_en_curso"]
+        keyboard.append([InlineKeyboardButton(
+            f"{w['name']} — {fmt_price(total)}",
+            callback_data=f"close_w_{w['id']}"
+        )])
+    keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="close_cancel")])
+
+    await update.message.reply_text(
+        "📋 *Cierre de producción*\n\n"
+        "Esto convierte la producción acumulada en deuda formal "
+        "(el contratista podrá cobrarla y empieza un período nuevo).\n\n"
+        "¿De quién vas a cerrar la producción?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return CLOSE_WORKER
+
+
+async def cierre_got_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "close_cancel":
+        await query.edit_message_text("❌ Cierre cancelado.")
+        return ConversationHandler.END
+
+    worker_id = int(query.data.replace("close_w_", ""))
+    worker = supabase.table("workers").select("*").eq("id", worker_id).execute().data
+    if not worker:
+        await query.edit_message_text("⚠️ Contratista no encontrado.")
+        return ConversationHandler.END
+
+    worker = worker[0]
+    estado = get_estado_contratista(worker_id)
+
+    if estado["total_produccion_en_curso"] <= 0:
+        await query.edit_message_text("⚠️ Este contratista no tiene producción en curso por cerrar.")
+        return ConversationHandler.END
+
+    context.user_data["close_worker_id"]   = worker_id
+    context.user_data["close_worker_name"] = worker["name"]
+    context.user_data["close_estado"]      = estado
+
+    detalle = (
+        f"📋 *Confirmar cierre — {worker['name']}*\n\n"
+        f"📦 Entregas a cerrar: {len(estado['produccion_en_curso'])}\n"
+        f"💵 Total a convertir en deuda: *{fmt_price(estado['total_produccion_en_curso'])}*\n"
+    )
+    if estado["deuda_formal"] > 0:
+        nueva_deuda = estado["deuda_formal"] + estado["total_produccion_en_curso"]
+        detalle += f"📌 Deuda actual: {fmt_price(estado['deuda_formal'])}\n"
+        detalle += f"📌 Deuda después del cierre: *{fmt_price(nueva_deuda)}*\n"
+
+    detalle += "\nUna vez confirmado, este cierre no se puede deshacer fácilmente. ¿Continuar?"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Confirmar cierre", callback_data="close_confirm_yes")],
+        [InlineKeyboardButton("❌ Cancelar",         callback_data="close_confirm_no")],
+    ]
+    await query.edit_message_text(detalle, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return CLOSE_CONFIRM
+
+
+async def cierre_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "close_confirm_no":
+        await query.edit_message_text("❌ Cierre cancelado.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    worker_id   = context.user_data.get("close_worker_id")
+    worker_name = context.user_data.get("close_worker_name")
+    estado      = context.user_data.get("close_estado")
+    verifier    = get_verifier(update.effective_user.id)
+
+    try:
+        # Determinar fecha_inicio del período: fin del último cierre o created_at de la primera entrega
+        ultimo_cierre = supabase.table("closures")\
+            .select("fecha_fin")\
+            .eq("worker_id", worker_id)\
+            .order("fecha_fin", desc=True)\
+            .limit(1)\
+            .execute().data
+        if ultimo_cierre:
+            fecha_inicio = ultimo_cierre[0]["fecha_fin"]
+        else:
+            fecha_inicio = estado["produccion_en_curso"][0]["created_at"]
+
+        # Crear el cierre
+        closure = supabase.table("closures").insert({
+            "worker_id":      worker_id,
+            "monto":          estado["total_produccion_en_curso"],
+            "fecha_inicio":   fecha_inicio,
+            "registrado_por": verifier["id"] if verifier else None,
+        }).execute().data[0]
+
+        # Asociar todas las entregas en curso a este cierre
+        for d in estado["produccion_en_curso"]:
+            supabase.table("deliveries").update({"closure_id": closure["id"]}).eq("id", d["id"]).execute()
+
+        nueva_deuda = estado["deuda_formal"] + estado["total_produccion_en_curso"]
+        respuesta = (
+            f"✅ *Cierre registrado*\n\n"
+            f"👤 {worker_name}\n"
+            f"📦 Entregas cerradas: {len(estado['produccion_en_curso'])}\n"
+            f"💵 Monto cerrado: {fmt_price(estado['total_produccion_en_curso'])}\n\n"
+            f"📌 *Deuda formal actualizada: {fmt_price(nueva_deuda)}*"
+        )
+        await query.edit_message_text(respuesta, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error en cierre: {e}")
+        await query.edit_message_text(f"⚠️ Error al registrar el cierre: {e}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def cierre_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cierre cancelado.")
+    return ConversationHandler.END
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMANDO /pagar — registrar pago sobre DEUDA FORMAL únicamente
 # ═══════════════════════════════════════════════════════════════
 
 async def pagar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1023,14 +1199,17 @@ async def pagar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Solo los verificadores pueden registrar pagos.")
         return ConversationHandler.END
 
-    workers = get_workers_with_pending_balance()
+    workers = get_workers_with_deuda_formal()
     if not workers:
-        await update.message.reply_text("✅ No hay contratistas con saldo por pagar en este momento.")
+        await update.message.reply_text(
+            "✅ No hay contratistas con deuda formal por pagar.\n\n"
+            "Recuerda: solo se puede pagar sobre producción que ya haya sido cerrada con /cierre."
+        )
         return ConversationHandler.END
 
     keyboard = []
     for w in workers:
-        total = w["cuenta"]["total_a_cobrar"]
+        total = w["estado"]["deuda_formal"]
         keyboard.append([InlineKeyboardButton(
             f"{w['name']} — {fmt_price(total)}",
             callback_data=f"pay_w_{w['id']}"
@@ -1038,7 +1217,9 @@ async def pagar_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="pay_cancel")])
 
     await update.message.reply_text(
-        "💰 *Registrar pago a contratista*\n\nElige a quién le vas a pagar:",
+        "💰 *Registrar pago a contratista*\n\n"
+        "Solo se paga sobre la deuda formal (producción ya cerrada).\n\n"
+        "¿A quién le vas a pagar?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -1060,25 +1241,22 @@ async def pagar_got_worker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     worker = worker[0]
-    cuenta = get_cuenta_actual(worker_id)
+    estado = get_estado_contratista(worker_id)
 
-    context.user_data["pay_worker_id"] = worker_id
+    context.user_data["pay_worker_id"]   = worker_id
     context.user_data["pay_worker_name"] = worker["name"]
-    context.user_data["pay_cuenta"] = cuenta
+    context.user_data["pay_estado"]      = estado
 
-    detalle = f"💼 *Cuenta de cobro de {worker['name']}*\n\n"
-    detalle += f"💵 Total facturado (entregas aprobadas): {fmt_price(cuenta['total_entregas'])}\n"
-    if cuenta["total_pagado"] > 0:
-        detalle += f"💸 Total ya pagado: {fmt_price(cuenta['total_pagado'])}\n"
-    detalle += f"\n*TOTAL A COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n\n"
+    detalle = (
+        f"💼 *Deuda formal de {worker['name']}*\n\n"
+        f"💵 Total cerrado: {fmt_price(estado['total_cerrado'])}\n"
+        f"💸 Total pagado: {fmt_price(estado['total_pagado'])}\n\n"
+        f"*DEUDA ACTUAL: {fmt_price(estado['deuda_formal'])}*\n"
+    )
+    if estado["total_produccion_en_curso"] > 0:
+        detalle += f"\n_Nota: hay {fmt_price(estado['total_produccion_en_curso'])} de producción en curso, sin cerrar todavía._\n"
 
-    if cuenta["entregas"]:
-        detalle += "_Últimas entregas:_\n"
-        for d in cuenta["entregas"][-8:]:
-            fecha = d["created_at"][:10]
-            detalle += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
-
-    detalle += f"\n¿Cuánto le vas a pagar? Escribe el monto en números (ej: `{int(cuenta['total_a_cobrar'])}` para pago total o menos para abono):"
+    detalle += f"\n¿Cuánto le vas a pagar? Escribe el monto en números (ej: `{int(estado['deuda_formal'])}` para pago total o menos para abono):"
 
     await query.edit_message_text(detalle, parse_mode="Markdown")
     return PAY_AMOUNT
@@ -1094,30 +1272,30 @@ async def pagar_got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Monto inválido. Escribe solo números (ej: 500000).")
         return PAY_AMOUNT
 
-    cuenta = context.user_data.get("pay_cuenta", {})
-    total_a_cobrar = cuenta.get("total_a_cobrar", 0)
+    estado = context.user_data.get("pay_estado", {})
+    deuda = estado.get("deuda_formal", 0)
 
-    if monto > total_a_cobrar:
+    if monto > deuda:
         await update.message.reply_text(
-            f"⚠️ El monto ({fmt_price(monto)}) es mayor a lo que se debe ({fmt_price(total_a_cobrar)}). "
-            "Escribe un valor igual o menor."
+            f"⚠️ El monto ({fmt_price(monto)}) es mayor a la deuda formal ({fmt_price(deuda)}). "
+            "Para pagar producción que aún no está cerrada, primero haz un /cierre."
         )
         return PAY_AMOUNT
 
-    saldo_pendiente = total_a_cobrar - monto
+    saldo_pendiente = deuda - monto
     context.user_data["pay_monto"] = monto
     context.user_data["pay_saldo_pendiente"] = saldo_pendiente
 
-    tipo = "TOTAL ✅" if saldo_pendiente == 0 else f"ABONO PARCIAL (queda debiendo {fmt_price(saldo_pendiente)})"
+    tipo = "PAGO TOTAL ✅" if saldo_pendiente == 0 else f"ABONO PARCIAL (queda debiendo {fmt_price(saldo_pendiente)})"
 
     resumen_txt = (
         f"📋 *Confirma el pago a {context.user_data['pay_worker_name']}*\n\n"
-        f"Total a cobrar: {fmt_price(total_a_cobrar)}\n"
-        f"Monto a pagar:  *{fmt_price(monto)}*\n"
+        f"Deuda actual: {fmt_price(deuda)}\n"
+        f"Monto a pagar: *{fmt_price(monto)}*\n"
         f"Tipo: {tipo}\n"
     )
     if saldo_pendiente > 0:
-        resumen_txt += f"\n💡 El saldo de {fmt_price(saldo_pendiente)} se arrastrará a la próxima cuenta de cobro."
+        resumen_txt += f"\n💡 La deuda restante de {fmt_price(saldo_pendiente)} se mantiene hasta el próximo pago."
 
     keyboard = [
         [InlineKeyboardButton("✅ Confirmar pago", callback_data="pay_confirm_yes")],
@@ -1136,34 +1314,32 @@ async def pagar_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-    worker_id = context.user_data.get("pay_worker_id")
+    worker_id   = context.user_data.get("pay_worker_id")
     worker_name = context.user_data.get("pay_worker_name")
-    cuenta = context.user_data.get("pay_cuenta")
-    monto = context.user_data.get("pay_monto")
+    estado      = context.user_data.get("pay_estado")
+    monto       = context.user_data.get("pay_monto")
     saldo_pendiente = context.user_data.get("pay_saldo_pendiente")
-    verifier = get_verifier(update.effective_user.id)
+    verifier    = get_verifier(update.effective_user.id)
 
     try:
-        # Crear el registro del pago
-        payment = supabase.table("payments").insert({
+        supabase.table("payments").insert({
             "worker_id":       worker_id,
-            "total_facturado": cuenta["total_a_cobrar"],
+            "total_facturado": estado["total_cerrado"],
             "monto_pagado":    monto,
             "saldo_pendiente": saldo_pendiente,
-            "saldo_previo":    cuenta["saldo_previo"],
+            "saldo_previo":    0,
             "registrado_por":  verifier["id"] if verifier else None,
-        }).execute().data[0]
+        }).execute()
 
         respuesta = (
             f"✅ *Pago registrado*\n\n"
             f"👤 {worker_name}\n"
             f"💵 Pagado: {fmt_price(monto)}\n"
-            f"📊 Cuenta de cobro saldada: {fmt_price(cuenta['total_a_cobrar'])}\n"
         )
         if saldo_pendiente > 0:
-            respuesta += f"\n📌 Saldo pendiente arrastrado: *{fmt_price(saldo_pendiente)}*"
+            respuesta += f"\n📌 Deuda restante: *{fmt_price(saldo_pendiente)}*"
         else:
-            respuesta += "\n🎉 ¡Cuenta totalmente saldada!"
+            respuesta += "\n🎉 ¡Deuda totalmente saldada!"
 
         await query.edit_message_text(respuesta, parse_mode="Markdown")
     except Exception as e:
@@ -1181,50 +1357,58 @@ async def pagar_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMANDO /cuenta — consultar saldo actual
+# COMANDO /cuenta — consultar estado actual
 # ═══════════════════════════════════════════════════════════════
 
 async def cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Si es contratista, ve su propia cuenta
     worker = get_worker(user_id)
     if worker:
-        cuenta = get_cuenta_actual(worker["id"])
-        msg = f"💼 *Tu cuenta de cobro actual*\n\n"
-        msg += f"💵 Total facturado: {fmt_price(cuenta['total_entregas'])}\n"
-        if cuenta["total_pagado"] > 0:
-            msg += f"💸 Ya recibido: {fmt_price(cuenta['total_pagado'])}\n"
-        msg += f"\n*TOTAL POR COBRAR: {fmt_price(cuenta['total_a_cobrar'])}*\n"
+        estado = get_estado_contratista(worker["id"])
+        msg = f"💼 *Tu estado actual*\n\n"
+        msg += f"🟢 *Producción en curso (sin cerrar):* {fmt_price(estado['total_produccion_en_curso'])}\n"
+        msg += f"   {len(estado['produccion_en_curso'])} entregas aprobadas\n\n"
+        msg += f"📌 *Deuda formal (ya cerrada):* {fmt_price(estado['deuda_formal'])}\n"
+        msg += f"   Cerrado histórico: {fmt_price(estado['total_cerrado'])} | Recibido: {fmt_price(estado['total_pagado'])}\n"
 
-        if cuenta["entregas"]:
-            msg += "\n_Últimas entregas:_\n"
-            for d in cuenta["entregas"][-10:]:
+        if estado["produccion_en_curso"]:
+            msg += "\n_Últimas entregas en curso:_\n"
+            for d in estado["produccion_en_curso"][-8:]:
                 fecha = d["created_at"][:10]
                 msg += f"  • {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
 
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    # Si es verificador, ve cuenta de todos los que tienen saldo
     if is_verifier(user_id):
-        workers = get_workers_with_pending_balance()
-        if not workers:
-            await update.message.reply_text("✅ Ningún contratista tiene saldo por cobrar en este momento.")
+        all_workers = supabase.table("workers").select("*").eq("activo", True).execute().data or []
+        relevantes = []
+        for w in all_workers:
+            estado = get_estado_contratista(w["id"])
+            if estado["total_produccion_en_curso"] > 0 or estado["deuda_formal"] > 0:
+                relevantes.append((w, estado))
+
+        if not relevantes:
+            await update.message.reply_text("✅ Ningún contratista tiene producción ni deuda actualmente.")
             return
 
-        msg = "💼 *Cuentas de cobro pendientes*\n\n"
-        total_general = 0
-        for w in workers:
-            c = w["cuenta"]
-            total_general += c["total_a_cobrar"]
+        msg = "💼 *Estado de contratistas*\n\n"
+        total_curso = 0
+        total_deuda = 0
+        for w, e in relevantes:
+            total_curso += e["total_produccion_en_curso"]
+            total_deuda += e["deuda_formal"]
             msg += f"👤 *{w['name']}*\n"
-            msg += f"   Facturado: {fmt_price(c['total_entregas'])}"
-            if c["total_pagado"] > 0:
-                msg += f" — Pagado: {fmt_price(c['total_pagado'])}"
-            msg += f"\n   *Por cobrar: {fmt_price(c['total_a_cobrar'])}*\n\n"
+            if e["total_produccion_en_curso"] > 0:
+                msg += f"   🟢 En curso: {fmt_price(e['total_produccion_en_curso'])}\n"
+            if e["deuda_formal"] > 0:
+                msg += f"   📌 Deuda formal: {fmt_price(e['deuda_formal'])}\n"
+            msg += "\n"
 
-        msg += f"━━━━━━━━━━━━━━━━━\n*Total general por pagar: {fmt_price(total_general)}*"
+        msg += f"━━━━━━━━━━━━━━━━━\n"
+        msg += f"🟢 Producción en curso total: *{fmt_price(total_curso)}*\n"
+        msg += f"📌 Deuda formal total: *{fmt_price(total_deuda)}*"
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
@@ -1232,7 +1416,116 @@ async def cuenta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-# COMANDO /historial — pagos pasados
+# COMANDO /produccion — producción en curso o de cierres anteriores
+# ═══════════════════════════════════════════════════════════════
+
+async def produccion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    worker = get_worker(user_id)
+    es_verificador = is_verifier(user_id)
+    args = [a.lower() for a in (context.args or [])]
+    ver_anteriores = "anteriores" in args or "anterior" in args or "pasadas" in args or "historial" in args
+    args_sin_kw = [a for a in args if a not in ("anteriores", "anterior", "pasadas", "historial")]
+
+    async def _mostrar_uno(w):
+        if ver_anteriores:
+            cierres = supabase.table("closures")\
+                .select("*")\
+                .eq("worker_id", w["id"])\
+                .order("fecha_fin", desc=True)\
+                .limit(10)\
+                .execute().data or []
+            if not cierres:
+                await update.message.reply_text(f"📭 {w['name']} aún no tiene cierres anteriores.")
+                return
+            msg = f"📜 *Cierres anteriores de {w['name']}*\n\n"
+            for c in cierres:
+                ini = c["fecha_inicio"][:10]
+                fin = c["fecha_fin"][:10]
+                msg += f"• Del {ini} al {fin}\n  💵 {fmt_price(float(c['monto']))}\n\n"
+            total = sum(float(c['monto']) for c in cierres)
+            msg += f"━━━━━━━━━━━━━━━━━\n*Total cerrado mostrado: {fmt_price(total)}*"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            estado = get_estado_contratista(w["id"])
+            ultimo_cierre = supabase.table("closures")\
+                .select("fecha_fin")\
+                .eq("worker_id", w["id"])\
+                .order("fecha_fin", desc=True)\
+                .limit(1)\
+                .execute().data
+            desde = ultimo_cierre[0]["fecha_fin"][:10] if ultimo_cierre else "(inicio)"
+            msg = f"🟢 *Producción en curso — {w['name']}*\n"
+            msg += f"_Desde el último cierre ({desde}) hasta hoy_\n\n"
+            if not estado["produccion_en_curso"]:
+                msg += "_Sin entregas aprobadas en este período._"
+            else:
+                for d in estado["produccion_en_curso"]:
+                    fecha = d["created_at"][:10]
+                    msg += f"• {fecha} — {d['product_name'][:35]} — {fmt_price(float(d.get('final_price', 0) or 0))}\n"
+                msg += f"\n*Total acumulado: {fmt_price(estado['total_produccion_en_curso'])}*"
+                if estado["deuda_formal"] > 0:
+                    msg += f"\n_(Además hay {fmt_price(estado['deuda_formal'])} de deuda formal por cobrar.)_"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+    # Contratista: ve la suya
+    if worker and not es_verificador:
+        await _mostrar_uno(worker)
+        return
+
+    # Verificador con argumento de contratista
+    if es_verificador and args_sin_kw:
+        nombre = " ".join(args_sin_kw)
+        workers_all = supabase.table("workers").select("*").execute().data or []
+        match = next((w for w in workers_all if nombre in w["name"].lower()), None)
+        if not match:
+            await update.message.reply_text(f"⚠️ No encontré un contratista con nombre similar a '{nombre}'.")
+            return
+        await _mostrar_uno(match)
+        return
+
+    # Verificador sin argumento: resumen general
+    if es_verificador:
+        if ver_anteriores:
+            cierres = supabase.table("closures")\
+                .select("*, workers(name)")\
+                .order("fecha_fin", desc=True)\
+                .limit(15)\
+                .execute().data or []
+            if not cierres:
+                await update.message.reply_text("📭 Aún no se han registrado cierres.")
+                return
+            msg = "📜 *Últimos cierres registrados*\n\n"
+            for c in cierres:
+                nombre = (c.get("workers") or {}).get("name", "?")
+                ini = c["fecha_inicio"][:10]
+                fin = c["fecha_fin"][:10]
+                msg += f"• {fin} — {nombre} — {fmt_price(float(c['monto']))} _(del {ini} al {fin})_\n"
+            msg += "\n💡 Para ver cierres de un contratista: `/produccion anteriores <nombre>`"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        # Producción en curso de todos
+        workers = get_workers_with_produccion_en_curso()
+        if not workers:
+            await update.message.reply_text("📭 Nadie tiene producción en curso ahora mismo.")
+            return
+        msg = "🟢 *Producción en curso (todos)*\n\n"
+        total = 0
+        for w in workers:
+            e = w["estado"]
+            total += e["total_produccion_en_curso"]
+            msg += f"👤 {w['name']} — {fmt_price(e['total_produccion_en_curso'])} ({len(e['produccion_en_curso'])} entregas)\n"
+        msg += f"\n━━━━━━━━━━━━━━━━━\n*Total general en curso: {fmt_price(total)}*"
+        msg += "\n💡 `/produccion <nombre>` para detalle | `/produccion anteriores` para cierres pasados"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("⚠️ No estás registrado en el sistema.")
+
+
+# ═══════════════════════════════════════════════════════════════
+# COMANDO /historial — pagos pasados (sigue igual)
 # ═══════════════════════════════════════════════════════════════
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1342,14 +1635,26 @@ def main():
         allow_reentry=True,
     )
 
+    close_conv = ConversationHandler(
+        entry_points=[CommandHandler("cierre", cierre_start)],
+        states={
+            CLOSE_WORKER:  [CallbackQueryHandler(cierre_got_worker, pattern=r"^close_(w_|cancel)")],
+            CLOSE_CONFIRM: [CallbackQueryHandler(cierre_confirm,    pattern=r"^close_confirm_")],
+        },
+        fallbacks=[CommandHandler("cancelar", cierre_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(conv)
     app.add_handler(pay_conv)
+    app.add_handler(close_conv)
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("mistotal",   mis_total))
     app.add_handler(CommandHandler("pendientes", pendientes))
     app.add_handler(CommandHandler("resumen",    resumen))
     app.add_handler(CommandHandler("precios",    precios))
     app.add_handler(CommandHandler("cuenta",     cuenta))
+    app.add_handler(CommandHandler("produccion", produccion))
     app.add_handler(CommandHandler("historial",  historial))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
