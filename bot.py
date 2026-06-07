@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove, ReplyKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -44,6 +44,11 @@ OFICIOS = {
     "esqueleteria":  "🔧 Esqueletería",
     "pintura":       "🎨 Pintura",
 }
+
+KB_CONTRATISTA = ReplyKeyboardMarkup(
+    [["📋 Mis trabajos"], ["/reportar", "/mistotal"]],
+    resize_keyboard=True
+)
 
 OFICIO, FVE, PRODUCT_NAME, PICK_PRODUCT, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(7)
 PAY_WORKER, PAY_AMOUNT, PAY_CONFIRM = range(10, 13)
@@ -412,11 +417,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 ¡Hola *{worker['name']}*!\n\n"
             f"*¿Qué puedes hacer?*\n"
+            f"• 📋 Mis trabajos — tus trabajos asignados (toca el botón de abajo)\n"
+            f"• /mistrabajos — lo mismo, por comando\n"
             f"• /reportar — registrar un producto terminado\n"
-            f"• /mistotal — ver tu acumulado semanal\n"
-            f"• /cancelar — cancelar un reporte en curso\n\n"
+            f"• /mistotal — ver tu acumulado semanal\n\n"
             f"_Livinghouse · Sistema de producción_",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=KB_CONTRATISTA
         )
     elif is_verifier(user.id):
         await update.message.reply_text(
@@ -1690,6 +1697,123 @@ async def _mostrar_historial(update: Update, nombre: str, pagos: list):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# ═══════════════════════════════════════════════════════════════
+# /MISTRABAJOS — bandeja del contratista (Fase 2a, solo lectura)
+# ═══════════════════════════════════════════════════════════════
+
+def _fmt_fecha_entrega(iso):
+    if not iso:
+        return "sin fecha"
+    try:
+        d = datetime.strptime(str(iso)[:10], "%Y-%m-%d").date()
+        dias = (d - datetime.now().date()).days
+        dl = d.strftime("%d/%m")
+        if dias < 0:  return f"⚠️ {dl} (atrasado {abs(dias)}d)"
+        if dias == 0: return f"{dl} (hoy)"
+        if dias == 1: return f"{dl} (mañana)"
+        return f"{dl} (en {dias} días)"
+    except Exception:
+        return str(iso)[:10]
+
+def _nombre_producto(t):
+    it = t.get("pedido_items") or {}
+    prod = it.get("productos") or {}
+    return prod.get("nombre") or it.get("nombre_referencia") or "Producto"
+
+def _precios_mano_obra(tareas):
+    """Devuelve {(producto_id, oficio_id): precio} para los productos de las tareas."""
+    prod_ids = list({(t.get("pedido_items") or {}).get("producto_id")
+                     for t in tareas if (t.get("pedido_items") or {}).get("producto_id")})
+    pmo = {}
+    if prod_ids:
+        try:
+            r = supabase.table("producto_mano_obra").select("producto_id,oficio_id,precio").in_("producto_id", prod_ids).execute()
+            for row in (r.data or []):
+                pmo[(row["producto_id"], row["oficio_id"])] = row["precio"]
+        except Exception as e:
+            logger.error(f"_precios_mano_obra: {e}")
+    return pmo
+
+async def mistrabajos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = get_worker(update.effective_user.id)
+    if not worker:
+        await update.message.reply_text("❌ No estás registrado en el sistema.")
+        return
+    try:
+        r = supabase.table("tareas").select(
+            "*, pedido_items(nombre_referencia,cantidad,fecha_entrega,producto_id,notas_especiales,"
+            "productos(nombre),pedidos(cliente,fve))"
+        ).eq("worker_id", worker["id"]).neq("estado", "terminada").execute()
+        tareas = r.data or []
+    except Exception as e:
+        logger.error(f"mistrabajos: {e}")
+        await update.message.reply_text("⚠️ No pude leer tus trabajos en este momento.")
+        return
+
+    pmo = _precios_mano_obra(tareas)
+    fkey = lambda t: ((t.get("pedido_items") or {}).get("fecha_entrega") or "9999-12-31")
+    pendientes = sorted([t for t in tareas if t.get("estado") == "pendiente"], key=fkey)
+    bloqueadas = sorted([t for t in tareas if t.get("estado") == "bloqueada"], key=fkey)
+
+    lines = [f"👷 *{worker['name']}*\n"]
+    buttons = []
+    if pendientes:
+        lines.append(f"📋 *PARA TRABAJAR ({len(pendientes)})* — en orden de prioridad")
+        for i, t in enumerate(pendientes, 1):
+            it = t.get("pedido_items") or {}; ped = it.get("pedidos") or {}
+            pr = pmo.get((it.get("producto_id"), t.get("oficio_id")))
+            precio_txt = fmt_price(pr) if pr is not None else "💲 por confirmar"
+            lines.append(f"\n*{i}. {_nombre_producto(t)}* ·x{int(it.get('cantidad') or 1)}  _{t.get('oficio_nombre','')}_")
+            lines.append(f"   👤 {ped.get('cliente','')} · FVE {ped.get('fve','')}")
+            lines.append(f"   📅 {_fmt_fecha_entrega(it.get('fecha_entrega'))}   💰 {precio_txt}")
+            if it.get("notas_especiales"):
+                lines.append(f"   📝 {str(it['notas_especiales'])[:90]}")
+            buttons.append([InlineKeyboardButton(f"👁 Ver #{i}", callback_data=f"mtver_{t['id']}")])
+    else:
+        lines.append("📋 No tienes trabajos pendientes ahora mismo. 🎉")
+
+    if bloqueadas:
+        lines.append(f"\n⏳ *EN CAMINO ({len(bloqueadas)})* — esperando que termine otro oficio")
+        for t in bloqueadas:
+            it = t.get("pedido_items") or {}
+            lines.append(f"   • {_nombre_producto(t)} _{t.get('oficio_nombre','')}_ — te avisaré cuando esté listo")
+
+    lines.append("\n_Toca 👁 Ver para los detalles de cada trabajo._")
+    markup = InlineKeyboardMarkup(buttons) if buttons else None
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=markup)
+
+async def mt_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        tid = int(q.data.split("_")[1])
+        r = supabase.table("tareas").select(
+            "*, pedido_items(nombre_referencia,cantidad,fecha_entrega,producto_id,notas_especiales,"
+            "productos(nombre),pedidos(cliente,fve))"
+        ).eq("id", tid).execute()
+        if not r.data:
+            await q.message.reply_text("No encontré ese trabajo.")
+            return
+        t = r.data[0]; it = t.get("pedido_items") or {}; ped = it.get("pedidos") or {}
+        pr = None
+        if it.get("producto_id"):
+            prq = supabase.table("producto_mano_obra").select("precio").eq("producto_id", it["producto_id"]).eq("oficio_id", t.get("oficio_id")).execute()
+            if prq.data:
+                pr = prq.data[0]["precio"]
+        txt = (f"📄 *{_nombre_producto(t)}*  ·x{int(it.get('cantidad') or 1)}\n"
+               f"🔧 Oficio: {t.get('oficio_nombre','')}\n"
+               f"👤 Cliente: {ped.get('cliente','')}\n"
+               f"🧾 FVE: {ped.get('fve','')}\n"
+               f"📅 Entrega: {_fmt_fecha_entrega(it.get('fecha_entrega'))}\n"
+               f"💰 Pago: {fmt_price(pr) if pr is not None else 'por confirmar con el verificador'}")
+        if it.get("notas_especiales"):
+            txt += f"\n\n📝 *Indicaciones:*\n{it['notas_especiales']}"
+        await q.message.reply_text(txt, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"mt_ver: {e}")
+        await q.message.reply_text("⚠️ No pude abrir ese trabajo.")
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -1740,7 +1864,10 @@ def main():
     app.add_handler(CommandHandler("cuenta",     cuenta))
     app.add_handler(CommandHandler("produccion", produccion))
     app.add_handler(CommandHandler("historial",  historial))
+    app.add_handler(CommandHandler("mistrabajos", mistrabajos))
+    app.add_handler(CallbackQueryHandler(mt_ver, pattern=r"^mtver_"))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
+    app.add_handler(MessageHandler(filters.Regex(r"^📋 Mis trabajos$"), mistrabajos))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_question))
 
