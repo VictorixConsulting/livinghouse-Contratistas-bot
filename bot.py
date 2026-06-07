@@ -53,6 +53,12 @@ KB_CONTRATISTA = ReplyKeyboardMarkup(
 OFICIO, FVE, PRODUCT_NAME, PICK_PRODUCT, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(7)
 PAY_WORKER, PAY_AMOUNT, PAY_CONFIRM = range(10, 13)
 CLOSE_WORKER, CLOSE_CONFIRM = range(20, 22)
+TFIN_PICK, TFIN_FOTO = range(30, 32)
+PREREQS_BOT = {
+    "esqueleteria": [], "carpinteria": [], "corte": [], "costura": [],
+    "pintado": ["carpinteria", "esqueleteria"],
+    "tapizado": ["esqueleteria", "carpinteria", "corte", "costura", "pintado"],
+}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1767,7 +1773,10 @@ async def mistrabajos(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"   📅 {_fmt_fecha_entrega(it.get('fecha_entrega'))}   💰 {precio_txt}")
             if it.get("notas_especiales"):
                 lines.append(f"   📝 {str(it['notas_especiales'])[:90]}")
-            buttons.append([InlineKeyboardButton(f"👁 Ver #{i}", callback_data=f"mtver_{t['id']}")])
+            buttons.append([
+                InlineKeyboardButton(f"👁 Ver #{i}", callback_data=f"mtver_{t['id']}"),
+                InlineKeyboardButton(f"✅ Terminé #{i}", callback_data=f"mtfin_{t['id']}"),
+            ])
     else:
         lines.append("📋 No tienes trabajos pendientes ahora mismo. 🎉")
 
@@ -1812,13 +1821,129 @@ async def mt_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"mt_ver: {e}")
         await q.message.reply_text("⚠️ No pude abrir ese trabajo.")
 
-async def termine_uno(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ Para marcar un trabajo terminado, ábrelo con 👁 *Ver* en tu lista.\n"
-        "_(El marcado con foto se activa en la próxima actualización.)_",
-        parse_mode="Markdown"
-    )
-    await mistrabajos(update, context)
+# ── Flujo "Terminé un trabajo" (Fase 2b) ──
+async def terminar_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    worker = get_worker(update.effective_user.id)
+    if not worker:
+        await update.message.reply_text("❌ No estás registrado."); return ConversationHandler.END
+    try:
+        r = supabase.table("tareas").select(
+            "id,oficio_nombre,pedido_items(nombre_referencia,productos(nombre))"
+        ).eq("worker_id", worker["id"]).eq("estado", "pendiente").execute()
+        tareas = r.data or []
+    except Exception as e:
+        logger.error(f"terminar_menu: {e}"); await update.message.reply_text("⚠️ Error al leer tus trabajos."); return ConversationHandler.END
+    if not tareas:
+        await update.message.reply_text("No tienes trabajos pendientes por marcar. 🎉", reply_markup=KB_CONTRATISTA)
+        return ConversationHandler.END
+    buttons = []
+    for t in tareas:
+        it = t.get("pedido_items") or {}
+        nombre = (it.get("productos") or {}).get("nombre") or it.get("nombre_referencia") or "Producto"
+        buttons.append([InlineKeyboardButton(f"{nombre[:28]} · {t.get('oficio_nombre','')}", callback_data=f"mtpick_{t['id']}")])
+    buttons.append([InlineKeyboardButton("❌ Cancelar", callback_data="mtpick_cancel")])
+    await update.message.reply_text("¿Cuál trabajo terminaste?", reply_markup=InlineKeyboardMarkup(buttons))
+    return TFIN_PICK
+
+async def terminar_picked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "mtpick_cancel":
+        await q.edit_message_text("Cancelado."); return ConversationHandler.END
+    context.user_data["fin_tarea_id"] = int(q.data.split("_")[1])
+    await q.edit_message_text("📸 Envía la *foto* del trabajo terminado.", parse_mode="Markdown")
+    return TFIN_FOTO
+
+async def terminar_desde_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    context.user_data["fin_tarea_id"] = int(q.data.split("_")[1])
+    await q.message.reply_text("📸 Envía la *foto* del trabajo terminado.", parse_mode="Markdown")
+    return TFIN_FOTO
+
+async def terminar_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("📸 Necesito una *foto* del trabajo terminado, o /cancelar para salir.", parse_mode="Markdown")
+        return TFIN_FOTO
+    worker = get_worker(update.effective_user.id)
+    tid = context.user_data.get("fin_tarea_id")
+    if not worker or not tid:
+        await update.message.reply_text("Algo salió mal. Abre 📋 Mis trabajos e intenta de nuevo.", reply_markup=KB_CONTRATISTA)
+        return ConversationHandler.END
+    photo = update.message.photo[-1]
+    try:
+        r = supabase.table("tareas").select("*, pedido_items(nombre_referencia,producto_id,pedidos(fve,cliente))").eq("id", tid).execute()
+        if not r.data:
+            await update.message.reply_text("No encontré ese trabajo."); return ConversationHandler.END
+        t = r.data[0]; it = t.get("pedido_items") or {}; ped = it.get("pedidos") or {}
+        nombre_prod = it.get("nombre_referencia") or "Producto"; prod_id = it.get("producto_id")
+        if prod_id:
+            pq = supabase.table("productos").select("nombre").eq("id", prod_id).execute()
+            if pq.data: nombre_prod = pq.data[0]["nombre"]
+        precio = None
+        if prod_id:
+            pm = supabase.table("producto_mano_obra").select("precio").eq("producto_id", prod_id).eq("oficio_id", t.get("oficio_id")).execute()
+            if pm.data: precio = pm.data[0]["precio"]
+        precio_pendiente = precio is None
+        final_price = float(precio) if precio is not None else 0
+        file = await context.bot.get_file(photo.file_id)
+        rec = {"worker_id": worker["id"], "fve": ped.get("fve", ""), "product_name": nombre_prod,
+               "is_special": precio_pendiente, "final_price": final_price,
+               "photo_file_id": photo.file_id, "photo_url": file.file_path, "status": "pending",
+               "notes": f"Oficio: {t.get('oficio_nombre','')}", "tarea_id": tid,
+               "precio_pendiente": precio_pendiente, "created_at": datetime.utcnow().isoformat()}
+        did = supabase.table("deliveries").insert(rec).execute().data[0]["id"]
+        supabase.table("tareas").update({"estado": "terminada", "fecha_terminada": datetime.utcnow().isoformat()}).eq("id", tid).execute()
+        # desbloquear dependientes
+        sib = supabase.table("tareas").select("id,oficio_nombre,estado,worker_id").eq("pedido_item_id", t["pedido_item_id"]).execute().data or []
+        present = [s["oficio_nombre"] for s in sib]
+        estado_de = {s["oficio_nombre"]: ("terminada" if s["id"] == tid else s["estado"]) for s in sib}
+        desbloqueados = []
+        for s in sib:
+            if s["id"] == tid or s["estado"] != "bloqueada": continue
+            pre = [p for p in PREREQS_BOT.get(s["oficio_nombre"], []) if p in present]
+            if all(estado_de.get(p) == "terminada" for p in pre):
+                supabase.table("tareas").update({"estado": "pendiente"}).eq("id", s["id"]).execute()
+                desbloqueados.append(s)
+        if all((s["id"] == tid or s["estado"] == "terminada") for s in sib):
+            supabase.table("pedido_items").update({"estado": "terminado"}).eq("id", t["pedido_item_id"]).execute()
+        # avisar a verificadores
+        tipo = "🔴 *PRECIO POR AUTORIZAR*" if precio_pendiente else "🟢 Precio de lista"
+        cap = (f"🏭 *NUEVA ENTREGA (desde orden)*\n{'─'*28}\n👷 *{worker['name']}*\n"
+               f"🏷️ Oficio: {t.get('oficio_nombre','')}\n📋 FVE: `{ped.get('fve','')}`\n📦 *{nombre_prod}*\n"
+               f"💰 *{fmt_price(final_price) if not precio_pendiente else 'por definir'}*\n{tipo}\nID: `{did}`")
+        btns = [[InlineKeyboardButton("✅ Aprobar", callback_data=f"approve_{did}"),
+                 InlineKeyboardButton("❌ Rechazar", callback_data=f"reject_{did}")]]
+        if precio_pendiente:
+            btns.append([InlineKeyboardButton("✏️ Aprobar con precio", callback_data=f"modify_{did}")])
+        for v in get_verifiers():
+            try:
+                await context.bot.send_photo(chat_id=v["telegram_id"], photo=photo.file_id, caption=cap,
+                                             reply_markup=InlineKeyboardMarkup(btns), parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"notif verificador: {e}")
+        # avisar a contratistas desbloqueados
+        for s in desbloqueados:
+            if s.get("worker_id"):
+                wq = supabase.table("workers").select("telegram_id").eq("id", s["worker_id"]).execute()
+                if wq.data and wq.data[0].get("telegram_id"):
+                    try:
+                        await context.bot.send_message(chat_id=wq.data[0]["telegram_id"],
+                            text=f"✅ Ya puedes empezar *{s['oficio_nombre']}* de {nombre_prod}.\nÁbrelo en 📋 Mis trabajos.", parse_mode="Markdown")
+                    except Exception as e:
+                        logger.error(f"notif desbloqueo: {e}")
+        msg = f"✅ *¡Trabajo enviado!*\n📦 {nombre_prod} — {t.get('oficio_nombre','')}\n"
+        msg += ("💰 Precio por confirmar con el verificador.\n" if precio_pendiente else f"💰 {fmt_price(final_price)}\n")
+        msg += "⏳ Pendiente de aprobación. Te aviso cuando lo aprueben 👍"
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=KB_CONTRATISTA)
+    except Exception as e:
+        logger.error(f"terminar_foto: {e}")
+        await update.message.reply_text("⚠️ No pude registrar el trabajo. Intenta de nuevo.", reply_markup=KB_CONTRATISTA)
+    context.user_data.pop("fin_tarea_id", None)
+    return ConversationHandler.END
+
+async def terminar_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("fin_tarea_id", None)
+    await update.message.reply_text("Cancelado.", reply_markup=KB_CONTRATISTA)
+    return ConversationHandler.END
 
 
 def main():
@@ -1860,9 +1985,24 @@ def main():
         allow_reentry=True,
     )
 
+    fin_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(terminar_desde_card, pattern=r"^mtfin_"),
+            MessageHandler(filters.Regex(r"^✅ Terminé uno$"), terminar_menu),
+        ],
+        states={
+            TFIN_PICK: [CallbackQueryHandler(terminar_picked, pattern=r"^mtpick_")],
+            TFIN_FOTO: [MessageHandler(filters.PHOTO, terminar_foto),
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, terminar_foto)],
+        },
+        fallbacks=[CommandHandler("cancelar", terminar_cancel)],
+        allow_reentry=True,
+    )
+
     app.add_handler(conv)
     app.add_handler(pay_conv)
     app.add_handler(close_conv)
+    app.add_handler(fin_conv)
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("mistotal",   mis_total))
     app.add_handler(CommandHandler("pendientes", pendientes))
@@ -1875,7 +2015,6 @@ def main():
     app.add_handler(CallbackQueryHandler(mt_ver, pattern=r"^mtver_"))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Mis trabajos$"), mistrabajos))
-    app.add_handler(MessageHandler(filters.Regex(r"^✅ Terminé uno$"), termine_uno))
     app.add_handler(MessageHandler(filters.Regex(r"^💰 Mi cuenta$"), cuenta))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_question))
