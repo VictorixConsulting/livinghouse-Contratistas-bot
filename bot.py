@@ -416,11 +416,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if worker:
         await update.message.reply_text(
             f"👋 ¡Hola *{worker['name']}*!\n\n"
-            f"*¿Qué puedes hacer?*\n"
-            f"• 📋 Mis trabajos — tus trabajos asignados (toca el botón de abajo)\n"
-            f"• /mistrabajos — lo mismo, por comando\n"
-            f"• /reportar — registrar un producto terminado\n"
-            f"• /mistotal — ver tu acumulado semanal\n\n"
+            f"Usa los botones de abajo 👇\n"
+            f"• 📋 *Mis trabajos* — lo que tienes asignado, en orden\n"
+            f"• ✅ *Terminé uno* — marcar un trabajo terminado\n"
+            f"• 💰 *Mi cuenta* — tu producción, deuda y pagos\n\n"
             f"_Livinghouse · Sistema de producción_",
             parse_mode="Markdown",
             reply_markup=KB_CONTRATISTA
