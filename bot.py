@@ -46,8 +46,8 @@ OFICIOS = {
 }
 
 KB_CONTRATISTA = ReplyKeyboardMarkup(
-    [["📋 Mis trabajos"], ["/reportar", "/mistotal"]],
-    resize_keyboard=True
+    [["📋 Mis trabajos"], ["✅ Terminé uno", "💰 Mi cuenta"]],
+    resize_keyboard=True, is_persistent=True
 )
 
 OFICIO, FVE, PRODUCT_NAME, PICK_PRODUCT, PRICE_TYPE, SPECIAL_PRICE, PHOTO = range(7)
@@ -714,7 +714,7 @@ async def got_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("❌ Reporte cancelado.\nUsa /reportar para empezar de nuevo.",
-                                     reply_markup=ReplyKeyboardRemove())
+                                     reply_markup=KB_CONTRATISTA if get_worker(update.effective_user.id) else ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
@@ -1813,6 +1813,14 @@ async def mt_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"mt_ver: {e}")
         await q.message.reply_text("⚠️ No pude abrir ese trabajo.")
 
+async def termine_uno(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ Para marcar un trabajo terminado, ábrelo con 👁 *Ver* en tu lista.\n"
+        "_(El marcado con foto se activa en la próxima actualización.)_",
+        parse_mode="Markdown"
+    )
+    await mistrabajos(update, context)
+
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1868,6 +1876,8 @@ def main():
     app.add_handler(CallbackQueryHandler(mt_ver, pattern=r"^mtver_"))
     app.add_handler(CallbackQueryHandler(handle_verification, pattern=r"^(approve|reject|modify)_"))
     app.add_handler(MessageHandler(filters.Regex(r"^📋 Mis trabajos$"), mistrabajos))
+    app.add_handler(MessageHandler(filters.Regex(r"^✅ Terminé uno$"), termine_uno))
+    app.add_handler(MessageHandler(filters.Regex(r"^💰 Mi cuenta$"), cuenta))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_question))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_question))
 
